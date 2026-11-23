@@ -1,0 +1,8 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "/^cd /tmp && node --import tsx --test vscode-vfs://github/Usernew0/Home/tests/auth\\.test\\.ts$/": {
+      "approve": true,
+      "matchCommandLine": true,
+    },
+  },
+}
