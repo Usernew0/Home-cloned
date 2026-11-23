@@ -3,7 +3,7 @@ import { lazySupabase } from "../../server/supabaseLazy.js";
 
 // ---------------------------------------------------------------------------
 // Supabase client (server side)
-// Prefers a non-VITE service role key; falls back to the VITE_ variables.
+// Uses the server service-role key, with the public anon key as legacy fallback.
 // ---------------------------------------------------------------------------
 const supabase = lazySupabase;
 

@@ -15,7 +15,7 @@ No production deployment, database migration, policy publication or backup has b
 - Any production mapping is a separate owner-approved data write after backup, before the scoped client is made available. No mapping script is run by this repository.
 
 ## 2. Configuration and indexes on isolated staging
-- SERVER_SESSION_SECRET: at least 32 random characters. Supabase URL, anon key and service-role key under the server's documented environment names.
+- SERVER_SESSION_SECRET: at least 32 random characters. SUPABASE_URL (preferred; VITE_SUPABASE_URL legacy alias), VITE_SUPABASE_ANON_KEY (public browser key at build time), and server-only SUPABASE_SERVICE_ROLE_KEY. The URL must be available at build time and runtime; never put a service-role key in a VITE_ variable. Stop if a build reports legacy browser-password configuration; review replacement protection before removing it.
 - Firebase Auth enabled, FIREBASE_SERVICE_ACCOUNT_EMAIL and FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY for the correct Firebase project/database. Default-tenant non-admin token minting requires an explicit reviewed FIREBASE_ALLOW_DEFAULT_TENANT choice, not a blanket workaround.
 - Leave ENABLE_PASSWORD_REHASH unset for the initial release.
 - Deploy and wait for composite indexes to build. Verify host function limits and routes. Nothing here authorizes changes to an owner's hosting account.

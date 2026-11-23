@@ -2,7 +2,7 @@
 
 ## Required Vercel environment variables (production fails closed without them)
 - SERVER_SESSION_SECRET: random, 32+ characters (login returns 500 and sessions are rejected without it)
-- SUPABASE_SERVICE_ROLE_KEY, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
+- SUPABASE_URL (preferred; legacy VITE_SUPABASE_URL supported), SUPABASE_SERVICE_ROLE_KEY, VITE_SUPABASE_ANON_KEY (public browser key)
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_WEBHOOK_SECRET (set the same value as secret_token in Telegram setWebhook)
 - GEMINI_API_KEY (for /api/generate-date)
 - ENABLE_PASSWORD_REHASH=true is OPTIONAL and OFF by default (see "Password migration")
@@ -69,3 +69,15 @@ User-account saves/deletes use the authenticated server rather than closed Fires
 The dependency lock was repaired without changing any previously locked package version. npm test adds synthetic credential workflow/cache tests and a generic-proxy overwrite denial regression. They do not test the production browser, Firebase project, Supabase RLS, media store or backup restoration. See DEPLOYMENT_PLAN.md for the release gates, especially tenant-field mapping BEFORE scoped reads and no open-rule credential stage.
 
 When an authoritative admin_accounts list exists, login no longer falls back to the stale legacy credentials row. Otherwise an old password could still work after editing the listed admin. Legacy-only installations still use the legacy row. Account parity must be reviewed before this behavior is deployed.
+
+## Environment naming and browser exposure (supersedes older environment advice)
+
+- Set `SUPABASE_URL` in the host environment. Express, shared API handlers and the lazy Telegram client prefer it over `VITE_SUPABASE_URL`. The public URL is also read during the Vite build and mapped to the existing browser public config. A runtime-only change cannot update a prebuilt frontend.
+- `VITE_SUPABASE_ANON_KEY` stays public and is needed during build for browser Auth/storage. There is no `SUPABASE_ANON_KEY` alias. Use the anon/public key, never the service-role key. Database/storage policies must protect data independently of public project configuration.
+- `SUPABASE_SERVICE_ROLE_KEY` and `SERVER_SESSION_SECRET` remain server-only. The legacy `VITE_SUPABASE_SERVICE_ROLE_KEY` alias is no longer accepted. Missing server URL/key leaves the database service unavailable; missing production session secret rejects sign-in. Legacy anon-key fallback on the server is retained for compatibility, but it does not grant service-role privileges or guarantee protected routes work.
+- Browser environment exposure is an explicit allowlist: project URL, anon key and optional `VITE_APP_USERNAME` display/reserved-name fallback. Arbitrary `VITE_` variables are no longer automatically exposed. No entire `process.env` object is injected.
+- **Compatibility gate:** nonempty `VITE_*PASSWORD*` or `VITE_SUPABASE_SERVICE_ROLE_KEY` values refuse the build without logging their values. Older milestone/category passwords were read in browser code and therefore were not secrets. They are not migrated by renaming them. Affected installations must stop and agree a reviewed server-side replacement before removing those values and releasing; simply deleting them can remove the old UI prompt. Existing card/record passcodes and universal UI bypasses remain legacy UI behavior, not secure access controls. This change does not certify those paths safe.
+- Firebase browser configuration still comes from `firebase-applet-config.json`. Firestore custom tokens need the matching `FIREBASE_SERVICE_ACCOUNT_EMAIL` and `FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY` at runtime; PEM newlines or escaped backslash-n are supported. Firebase Auth, tenant mapping and release gates still apply.
+- Optional runtime features use `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET` and `GEMINI_API_KEY`. Do not prefix secrets with `VITE_`. Leave password rehash and default-tenant opt-ins disabled unless separately reviewed.
+- On Vercel, configure the intended Production/Preview environment scope yourself and perform a reviewed rebuild/redeploy after the code and configuration are ready. No Vercel configuration, deployment or database action is performed by this patch. Do not send secret values in chat. See `.env.example` for names only.
+- Environment naming does not make GitHub Pages execute backend APIs. Pages remains static-only. Never publish this project's entire `dist` folder as static output: the current build also places backend bundles and sourcemaps there.

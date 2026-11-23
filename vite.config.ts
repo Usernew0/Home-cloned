@@ -1,11 +1,18 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
+import { publicBuildEnv } from './config/publicEnv';
 
-export default defineConfig(() => {
+export default defineConfig(({ mode }) => {
+  const publicEnv = publicBuildEnv(loadEnv(mode, process.cwd(), ''));
   return {
     plugins: [react(), tailwindcss()],
+    // Expose only reviewed public values, never the entire hosting environment.
+    envPrefix: [],
+    define: Object.fromEntries(Object.entries(publicEnv).map(([key, value]) => [
+      `import.meta.env.${key}`, JSON.stringify(value),
+    ])),
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
