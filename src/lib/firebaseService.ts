@@ -8,8 +8,10 @@ import {
   orderBy,
   limit,
   getDocs,
+  where,
   getDocFromServer
 } from 'firebase/firestore';
+import { getFirebaseScope } from './firebaseScope';
 import { db, isFirestoreOnline } from './firebase';
 import { 
   ChatMessage, 
@@ -103,23 +105,59 @@ export function normalizeCoupleId<T extends Record<string, any>>(item: T): T {
   };
 }
 
+/** Couple-scoped collection query. Admins read everything; everyone else only their own couple (rules enforce the same). */
+function scopedCol(name: string) {
+  const scope = getFirebaseScope();
+  const base = collection(db, name);
+  if (!scope || scope.role === 'admin') return base;
+  return query(base, where('coupleId', '==', scope.coupleId));
+}
+
 // ==========================================
 // REAL-TIME CHAT MESSAGES
 // ==========================================
 
 export function subscribeToChatMessages(callback: (data: ChatMessage[]) => void) {
-  // Query limited to 1000 chat messages to optimize reads and provide rich history across DMs and group chats
-  const chatQuery = query(collection(db, 'chatMessages'), orderBy('timestamp', 'asc'), limit(1000));
+  const scope = getFirebaseScope();
+  const onErr = (error: unknown) => handleFirestoreError(error, OperationType.GET, 'chatMessages');
+  const chats = collection(db, 'chatMessages');
+  if (!scope || scope.role === 'admin') {
+    // Query limited to 1000 chat messages to optimize reads and provide rich history across DMs and group chats
+    return onSnapshot(query(chats, orderBy('timestamp', 'asc'), limit(1000)), (snapshot) => {
+      const list: ChatMessage[] = [];
+      snapshot.forEach((doc) => list.push(normalizeCoupleId(doc.data() as ChatMessage)));
+      callback(list);
+    }, onErr);
+  }
 
-  return onSnapshot(chatQuery, (snapshot) => {
-    const list: ChatMessage[] = [];
-    snapshot.forEach((doc) => {
-      list.push(normalizeCoupleId(doc.data() as ChatMessage));
-    });
-    callback(list);
-  }, (error) => {
-    handleFirestoreError(error, OperationType.GET, 'chatMessages');
+  // Non-admins: union of (own couple) + (sent by me) + (sent to me) + (global lounge) + (groups I belong to).
+  // Each is a separate constrained query so the security rules can prove access per query.
+  const buckets = new Map<string, ChatMessage[]>();
+  const emit = () => {
+    const byId = new Map<string, ChatMessage>();
+    buckets.forEach((arr) => arr.forEach((m) => byId.set(m.id, m)));
+    callback(Array.from(byId.values()).sort((x, y) => (x.timestamp < y.timestamp ? -1 : x.timestamp > y.timestamp ? 1 : 0)).slice(-1000));
+  };
+  const listen = (key: string, field: string, value: string) =>
+    onSnapshot(query(chats, where(field, '==', value), orderBy('timestamp', 'asc'), limit(500)), (snapshot) => {
+      const arr: ChatMessage[] = [];
+      snapshot.forEach((d) => arr.push(normalizeCoupleId(d.data() as ChatMessage)));
+      buckets.set(key, arr);
+      emit();
+    }, onErr);
+  const unsubs: Array<() => void> = [
+    listen('couple', 'coupleId', scope.coupleId),
+    listen('sent', 'sender', scope.username),
+    listen('received', 'receiver', scope.username),
+    listen('global', 'conversationId', 'global'),
+  ];
+  const groupUnsubs = new Map<string, () => void>();
+  const unsubGroups = subscribeToChatGroups((groups) => {
+    const ids = new Set(groups.filter((g) => (g.members || []).includes(scope.username)).map((g) => g.id));
+    groupUnsubs.forEach((u, id) => { if (!ids.has(id)) { u(); groupUnsubs.delete(id); buckets.delete(`g:${id}`); } });
+    ids.forEach((id) => { if (!groupUnsubs.has(id)) groupUnsubs.set(id, listen(`g:${id}`, 'conversationId', id)); });
   });
+  return () => { unsubs.forEach((u) => u()); groupUnsubs.forEach((u) => u()); unsubGroups(); };
 }
 
 export async function saveChatMessageDoc(message: ChatMessage) {
@@ -144,15 +182,27 @@ export async function deleteChatMessageDoc(id: string) {
 // ==========================================
 
 export function subscribeToChatGroups(callback: (data: ChatGroup[]) => void) {
-  return onSnapshot(collection(db, 'chatGroups'), (snapshot) => {
-    const list: ChatGroup[] = [];
-    snapshot.forEach((doc) => {
-      list.push(doc.data() as ChatGroup);
-    });
-    callback(list);
-  }, (error) => {
-    handleFirestoreError(error, OperationType.GET, 'chatGroups');
-  });
+  const scope = getFirebaseScope();
+  const onErr = (error: unknown) => handleFirestoreError(error, OperationType.GET, 'chatGroups');
+  if (!scope || scope.role === 'admin') {
+    return onSnapshot(collection(db, 'chatGroups'), (snapshot) => {
+      const list: ChatGroup[] = [];
+      snapshot.forEach((doc) => list.push(doc.data() as ChatGroup));
+      callback(list);
+    }, onErr);
+  }
+  // Members and pending invitees only. Two listeners, merged by id.
+  const member = new Map<string, ChatGroup>();
+  const pending = new Map<string, ChatGroup>();
+  const emit = () => callback(Array.from(new Map([...pending, ...member]).values()));
+  const fill = (m: Map<string, ChatGroup>) => (snapshot: any) => {
+    m.clear();
+    snapshot.forEach((d: any) => m.set(d.id, d.data() as ChatGroup));
+    emit();
+  };
+  const u1 = onSnapshot(query(collection(db, 'chatGroups'), where('members', 'array-contains', scope.username)), fill(member), onErr);
+  const u2 = onSnapshot(query(collection(db, 'chatGroups'), where('pendingMembers', 'array-contains', scope.username)), fill(pending), onErr);
+  return () => { u1(); u2(); };
 }
 
 export async function saveChatGroupDoc(group: ChatGroup) {
@@ -185,9 +235,11 @@ export async function updateUserPresenceDoc(
   const cleanUsername = username.trim();
   const docId = cleanUsername;
   try {
+    const scope = getFirebaseScope();
     const presenceDoc: UserPresence = {
       username: cleanUsername,
       lastActive: new Date().toISOString(),
+      ...(scope ? { coupleId: scope.coupleId } : {}),
     };
     if (typeof lastReadChatTime === 'number') {
       presenceDoc.lastReadChatTime = lastReadChatTime;
@@ -210,7 +262,7 @@ export async function updateUserPresenceDoc(
 }
 
 export function subscribeToPresence(callback: (data: UserPresence[]) => void) {
-  return onSnapshot(collection(db, 'presence'), (snapshot) => {
+  return onSnapshot(scopedCol('presence'), (snapshot) => {
     const list: UserPresence[] = [];
     snapshot.forEach((doc) => {
       list.push(doc.data() as UserPresence);
@@ -226,7 +278,7 @@ export function subscribeToPresence(callback: (data: UserPresence[]) => void) {
 // ==========================================
 
 export function subscribeToFirestoreActivityLogs(callback: (data: UserActivityLog[]) => void) {
-  const logsQuery = query(collection(db, 'activityLogs'), orderBy('timestamp', 'desc'), limit(200));
+  const logsQuery = query(scopedCol('activityLogs'), orderBy('timestamp', 'desc'), limit(200));
 
   return onSnapshot(logsQuery, (snapshot) => {
     const list: UserActivityLog[] = [];
@@ -250,7 +302,7 @@ export async function saveActivityLogDoc(log: UserActivityLog) {
 
 export async function getFirestoreActivityLogs(): Promise<UserActivityLog[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'activityLogs'));
+    const snapshot = await getDocs(scopedCol('activityLogs'));
     const list: UserActivityLog[] = [];
     snapshot.forEach((d) => {
       list.push(normalizeCoupleId(d.data() as UserActivityLog));
@@ -426,7 +478,7 @@ export async function saveFirestoreAdminSettingDoc(setting: AdminSetting) {
 // ==========================================
 
 export function subscribeToFirestoreMilestones(callback: (data: Milestone[]) => void) {
-  return onSnapshot(collection(db, 'milestones'), (snapshot) => {
+  return onSnapshot(scopedCol('milestones'), (snapshot) => {
     const list: Milestone[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as Milestone));
@@ -459,7 +511,7 @@ export async function deleteFirestoreMilestoneDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreDatePlans(callback: (data: DatePlan[]) => void) {
-  return onSnapshot(collection(db, 'datePlans'), (snapshot) => {
+  return onSnapshot(scopedCol('datePlans'), (snapshot) => {
     const list: DatePlan[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as DatePlan));
@@ -492,7 +544,7 @@ export async function deleteFirestoreDatePlanDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreMemories(callback: (data: Memory[]) => void) {
-  return onSnapshot(collection(db, 'memories'), (snapshot) => {
+  return onSnapshot(scopedCol('memories'), (snapshot) => {
     const list: Memory[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as Memory));
@@ -525,7 +577,7 @@ export async function deleteFirestoreMemoryDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreLetters(callback: (data: LoveLetter[]) => void) {
-  return onSnapshot(collection(db, 'letters'), (snapshot) => {
+  return onSnapshot(scopedCol('letters'), (snapshot) => {
     const list: LoveLetter[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as LoveLetter));
@@ -558,7 +610,7 @@ export async function deleteFirestoreLetterDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreCoupleQuestions(callback: (data: CoupleQuestion[]) => void) {
-  return onSnapshot(collection(db, 'coupleQuestions'), (snapshot) => {
+  return onSnapshot(scopedCol('coupleQuestions'), (snapshot) => {
     const list: CoupleQuestion[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as CoupleQuestion));
@@ -588,7 +640,7 @@ export async function deleteFirestoreCoupleQuestionDoc(id: string) {
 
 export async function getFirestoreMilestones(): Promise<Milestone[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'milestones'));
+    const snapshot = await getDocs(scopedCol('milestones'));
     const list: Milestone[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as Milestone)));
     return list;
@@ -600,7 +652,7 @@ export async function getFirestoreMilestones(): Promise<Milestone[]> {
 
 export async function getFirestoreDatePlans(): Promise<DatePlan[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'datePlans'));
+    const snapshot = await getDocs(scopedCol('datePlans'));
     const list: DatePlan[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as DatePlan)));
     return list;
@@ -612,7 +664,7 @@ export async function getFirestoreDatePlans(): Promise<DatePlan[]> {
 
 export async function getFirestoreMemories(): Promise<Memory[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'memories'));
+    const snapshot = await getDocs(scopedCol('memories'));
     const list: Memory[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as Memory)));
     return list;
@@ -624,7 +676,7 @@ export async function getFirestoreMemories(): Promise<Memory[]> {
 
 export async function getFirestoreLetters(): Promise<LoveLetter[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'letters'));
+    const snapshot = await getDocs(scopedCol('letters'));
     const list: LoveLetter[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as LoveLetter)));
     return list;
@@ -636,7 +688,7 @@ export async function getFirestoreLetters(): Promise<LoveLetter[]> {
 
 export async function getFirestoreCoupleQuestions(): Promise<CoupleQuestion[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'coupleQuestions'));
+    const snapshot = await getDocs(scopedCol('coupleQuestions'));
     const list: CoupleQuestion[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as CoupleQuestion)));
     return list;
@@ -672,7 +724,7 @@ export async function getFirestoreCoupleTenants(): Promise<CoupleTenant[]> {
 
 export async function getFirestoreChatMessages(): Promise<ChatMessage[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'chatMessages'));
+    const snapshot = await getDocs(scopedCol('chatMessages'));
     const list: ChatMessage[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as ChatMessage)));
     return list;
@@ -687,7 +739,7 @@ export async function getFirestoreChatMessages(): Promise<ChatMessage[]> {
 // ==========================================
 
 export function subscribeToFirestoreCelebrationCards(callback: (data: CelebrationCard[]) => void) {
-  return onSnapshot(collection(db, 'celebrationCards'), (snapshot) => {
+  return onSnapshot(scopedCol('celebrationCards'), (snapshot) => {
     const list: CelebrationCard[] = [];
     snapshot.forEach((doc) => {
       const card = normalizeCoupleId(doc.data() as CelebrationCard);
@@ -720,7 +772,7 @@ export async function deleteFirestoreCelebrationCardDoc(id: string) {
 
 export async function getFirestoreCelebrationCards(): Promise<CelebrationCard[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'celebrationCards'));
+    const snapshot = await getDocs(scopedCol('celebrationCards'));
     const list: CelebrationCard[] = [];
     snapshot.forEach((d) => {
       const card = normalizeCoupleId(d.data() as CelebrationCard);
@@ -744,7 +796,7 @@ export function subscribeToFirestoreMusicTracks(
   coupleId?: string, 
   userId?: string
 ) {
-  return onSnapshot(collection(db, 'musicTracks'), (snapshot) => {
+  return onSnapshot(scopedCol('musicTracks'), (snapshot) => {
     const list: MusicTrack[] = [];
     snapshot.forEach((doc) => {
       const track = normalizeCoupleId(doc.data() as MusicTrack);
@@ -791,7 +843,7 @@ export async function deleteFirestoreMusicTrackDoc(id: string) {
 
 export async function getFirestoreMusicTracks(coupleId?: string, userId?: string): Promise<MusicTrack[]> {
   try {
-    const snapshot = await getDocs(collection(db, 'musicTracks'));
+    const snapshot = await getDocs(scopedCol('musicTracks'));
     const list: MusicTrack[] = [];
     snapshot.forEach((d) => {
       const track = normalizeCoupleId(d.data() as MusicTrack);

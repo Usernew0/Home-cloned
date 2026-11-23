@@ -20,7 +20,7 @@ interface TwoFactorSetupModalProps {
   isAlreadyEnabled?: boolean;
   currentSecret?: string;
   currentBackupCodes?: string[];
-  onSave2FA: (secret: string, backupCodes: string[]) => Promise<void>;
+  onSave2FA: (secret: string, backupCodes: string[], enrollCode: string) => Promise<void>;
   onDisable2FA: () => Promise<void>;
 }
 
@@ -137,11 +137,11 @@ export const TwoFactorSetupModal: React.FC<TwoFactorSetupModalProps> = ({
         return;
       }
 
-      await onSave2FA(secret, backupCodes);
+      await onSave2FA(secret, backupCodes, testCode.trim());
       setSuccessMsg('Two-Factor Authentication successfully enabled and secured!');
       setStep('backup_codes');
     } catch (err) {
-      setErrorMsg('Failed to save 2FA configuration to database.');
+      setErrorMsg((err as Error)?.message || 'Failed to save 2FA configuration.');
     } finally {
       setIsSaving(false);
     }
@@ -154,7 +154,7 @@ export const TwoFactorSetupModal: React.FC<TwoFactorSetupModalProps> = ({
       await onDisable2FA();
       onClose();
     } catch (err) {
-      setErrorMsg('Failed to disable 2FA.');
+      setErrorMsg((err as Error)?.message || 'Failed to disable 2FA.');
     } finally {
       setIsSaving(false);
     }

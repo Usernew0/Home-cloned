@@ -1,6 +1,7 @@
 import { initializeApp } from 'firebase/app';
 import { initializeFirestore, doc, getDocFromServer, setLogLevel } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
+import { getAuth } from 'firebase/auth';
 import config from '../../firebase-applet-config.json';
 
 // Suppress internal WebChannel transport-cycling warnings (e.g. transient RPC 'Listen' stream warnings during socket cycling)
@@ -41,6 +42,9 @@ const firebaseConfig = {
 };
 
 const app = initializeApp(firebaseConfig);
+
+// Firebase Auth: the app signs in with a server-minted custom token (see firebaseScope.ts).
+export const firebaseAuth = getAuth(app);
 
 // Initialize Firebase Storage
 export const firebaseStorage = getStorage(app);

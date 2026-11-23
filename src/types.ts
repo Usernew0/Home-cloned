@@ -111,6 +111,7 @@ export interface ChatMessage {
 
 export interface UserPresence {
   username: string;
+  coupleId?: string; // tenant scope so partners see each other's presence without a global read
   lastActive: string; // ISO string
   lastReadChatTime?: number;
   typingIn?: string | null;

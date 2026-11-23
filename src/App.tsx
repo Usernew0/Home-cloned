@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, Suspense, lazy } from "react";
+import { endFirebaseSession } from "./lib/firebaseScope";
 import { motion, AnimatePresence } from "motion/react";
 import { Heart, Calendar, Image as ImageIcon, Images, Mail, Sparkles, Clock, Gift, HeartHandshake, ChevronRight, MessageSquareHeart, Lock, LogOut, Bell, BellOff, X, ChevronLeft, Volume2, VolumeX, HelpCircle, Menu, Grid, ChevronDown, ChevronUp, Crown, User, Music, Headphones, Disc } from "lucide-react";
 
@@ -1293,6 +1294,7 @@ export default function App() {
     const userBeforeLogout = currentUser;
     supabase?.auth.signOut().catch(() => {});
     localStorage.removeItem("love_server_session_token");
+    void endFirebaseSession();
     setIsLoggedIn(false);
     setCurrentUser("");
     localStorage.removeItem("love_app_is_logged_in");

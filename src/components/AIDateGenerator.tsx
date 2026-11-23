@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { Sparkles, Calendar, DollarSign, MapPin, Clock, Heart, Check, Plus, Lock } from 'lucide-react';
 import { DatePlan, SubscriptionTier } from '../types';
+import { authHeaders } from '../lib/authHeaders';
 
 interface AIDateGeneratorProps {
   onAddPlan: (plan: DatePlan) => void;
@@ -35,7 +36,7 @@ export const AIDateGenerator: React.FC<AIDateGeneratorProps> = ({
     try {
       const response = await fetch('/api/generate-date', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ occasion, budget, mood, location, duration })
       });
       const data = await response.json();

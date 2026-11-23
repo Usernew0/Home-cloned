@@ -1,4 +1,5 @@
 import { TelegramConfig, DEFAULT_TELEGRAM_CONFIG, AdminSetting, UserAccount, TelegramAuthorizedUser, TelegramCapturedSender, TelegramAlertOptions } from "../types";
+import { authHeaders } from './authHeaders';
 
 /**
  * Resolves active Telegram configuration from AdminSettings, local cache, or defaults
@@ -102,7 +103,7 @@ export async function testTelegramConnection(botToken: string, chatId: string): 
   try {
     const response = await fetch("/api/telegram/test", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({ chatId: cleanChat }),
     });
 
@@ -128,7 +129,7 @@ export async function testTelegramConnection(botToken: string, chatId: string): 
  */
 export async function fetchCapturedTelegramSenders(): Promise<TelegramCapturedSender[]> {
   try {
-    const res = await fetch("/api/telegram/senders");
+    const res = await fetch("/api/telegram/senders", { headers: authHeaders() });
     const parsed = await safeParseResponse(res);
     if (parsed.isJson && res.ok && Array.isArray(parsed.data?.senders)) {
       try {
@@ -156,7 +157,7 @@ export async function fetchCapturedTelegramSenders(): Promise<TelegramCapturedSe
 export async function clearCapturedTelegramSenders(): Promise<boolean> {
   try {
     localStorage.removeItem("love_telegram_captured_senders");
-    await fetch("/api/telegram/senders/clear", { method: "POST" });
+    await fetch("/api/telegram/senders/clear", { method: "POST", headers: authHeaders() });
     return true;
   } catch (e) {
     return false;
@@ -182,7 +183,7 @@ export async function fetchTelegramChatIdsDetailed(botToken: string): Promise<{
   try {
     const res = await fetch("/api/telegram/updates", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({}),
     });
     const parsed = await safeParseResponse(res);
@@ -584,7 +585,7 @@ export async function sendTelegramAlert(message: string, type: "milestone" | "da
     try {
       const res = await fetch("/api/telegram/send", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({
           chatId: targetChatId,
           text: message,
@@ -623,7 +624,7 @@ export async function sendDirectTelegramMessage(botToken: string, chatId: string
   try {
     const res = await fetch("/api/telegram/send", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({
         chatId: cleanChat,
         text: message,
@@ -652,7 +653,7 @@ export async function setTelegramWebhook(_botToken: string, webhookUrl: string):
   try {
     const res = await fetch("/api/telegram/webhook/set", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({ webhookUrl: cleanUrl }),
     });
     const parsed = await safeParseResponse(res);
@@ -667,7 +668,7 @@ export async function setTelegramWebhook(_botToken: string, webhookUrl: string):
 
 export async function getTelegramWebhookInfo(_botToken: string): Promise<{ success: boolean; info?: any; error?: string }> {
   try {
-    const res = await fetch("/api/telegram/webhook/info", { method: "POST", headers: { "Content-Type": "application/json" } });
+    const res = await fetch("/api/telegram/webhook/info", { method: "POST", headers: authHeaders() });
     const parsed = await safeParseResponse(res);
     if (parsed.isJson && res.ok && parsed.data?.success) return { success: true, info: parsed.data.info };
     return { success: false, error: parsed.data?.error || `HTTP ${res.status}` };
@@ -678,7 +679,7 @@ export async function getTelegramWebhookInfo(_botToken: string): Promise<{ succe
 
 export async function deleteTelegramWebhook(_botToken: string): Promise<{ success: boolean; message?: string; error?: string }> {
   try {
-    const res = await fetch("/api/telegram/webhook/delete", { method: "POST", headers: { "Content-Type": "application/json" } });
+    const res = await fetch("/api/telegram/webhook/delete", { method: "POST", headers: authHeaders() });
     const parsed = await safeParseResponse(res);
     if (parsed.isJson && res.ok && parsed.data?.success) {
       return { success: true, message: parsed.data.message || "Webhook removed successfully!" };
@@ -971,7 +972,7 @@ export async function runTelegramBotDiagnostics(botToken: string, chatId?: strin
   try {
     const res = await fetch("/api/telegram/diagnose", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({
         chatId: cleanChat || undefined,
         testMessage,

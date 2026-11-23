@@ -1,13 +1,13 @@
 {
   "cleanUrls": true,
   "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/api/$1"
-    },
-    {
-      "source": "/((?!api/).*)",
-      "destination": "/index.html"
-    }
+    { "source": "/api/stripe/checkout", "destination": "/api/unsupported?f=payments" },
+    { "source": "/api/upload-audio", "destination": "/api/unsupported?f=audio" },
+    { "source": "/api/telegram/senders/clear", "destination": "/api/unsupported?f=senders" },
+    { "source": "/api/telegram/senders", "destination": "/api/unsupported?f=senders" },
+    { "source": "/api/telegram/diagnose", "destination": "/api/unsupported?f=diagnose" },
+    { "source": "/api/telegram/webhook/(set|info|delete)", "destination": "/api/unsupported?f=webhook" },
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]
 }

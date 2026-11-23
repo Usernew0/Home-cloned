@@ -1,9 +1,10 @@
-import { createClient } from "@supabase/supabase-js";
+import { withRole, MEMBERS } from "../../server/guards.js";
+import { lazySupabase } from "../../server/supabaseLazy.js";
 import { createHash } from "node:crypto";
 
-const supabase = createClient(process.env.VITE_SUPABASE_URL!, (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY)!);
+const supabase = lazySupabase;
 
-export default async function handler(req: any, res: any) {
+async function handler(req: any, res: any) {
   if (req.method !== "POST") {
     return res.status(405).json({ success: false, error: "Method not allowed" });
   }
@@ -63,3 +64,5 @@ export default async function handler(req: any, res: any) {
     return res.status(500).json({ success: false, error: err.message || "Server error" });
   }
 }
+
+export default withRole(MEMBERS, handler);

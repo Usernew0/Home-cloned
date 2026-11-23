@@ -1,11 +1,11 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
+import { startFirebaseSession } from "../lib/firebaseScope";
 import { motion } from "motion/react";
 import { Heart, Lock, User, Sparkles, KeyRound, ShieldAlert, ShieldCheck } from "lucide-react";
-import { UserAccount, AdminSetting, AdminAccount } from "../types";
-import { verifyPassword, getClientIp, isUnusualAccessHour } from "../utils/crypto";
-import { logActivity, saveUserAccountDoc, saveAdminSettingDoc } from "../lib/syncService";
+import { UserAccount, AdminSetting } from "../types";
+import { getClientIp, isUnusualAccessHour } from "../utils/crypto";
+import { logActivity } from "../lib/syncService";
 import { TwoFactorAuthStep } from "./TwoFactorAuthStep";
-import { verifyTOTP, verifyAndConsumeBackupCode } from "../lib/totp";
 import { sendTelegramAlert, formatSecurityAlertTelegramMessage } from "../lib/telegramService";
 import { supabase } from "../lib/supabase";
 
@@ -17,11 +17,7 @@ interface LoginProps {
 }
 
 interface TwoFactorPendingAccount {
-  type: "adminAccount" | "legacyAdmin" | "userAccount";
   username: string;
-  secret: string;
-  backupCodes: string[];
-  accountObj: any;
 }
 
 export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, adminSettings, logoutMessage }) => {
@@ -33,6 +29,8 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, admi
 
   // 2FA pending state
   const [pending2FA, setPending2FA] = useState<TwoFactorPendingAccount | null>(null);
+  // Held only in memory between the password step and the 2FA step; never persisted.
+  const pendingPasswordRef = useRef("");
 
   // Anti-brute-force rate limiting state
   const [failedAttempts, setFailedAttempts] = useState<number>(() => {
@@ -73,6 +71,69 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, admi
   const configuredMaxAttempts = Math.max(1, secDoc?.loginMaxAttempts ?? 5);
   const configuredLockoutSeconds = Math.max(5, secDoc?.loginLockoutSeconds ?? 60);
 
+  type ServerLoginResult = { success: boolean; username?: string; requires2fa?: boolean; error?: string; status?: number };
+
+  // All credential and second-factor checks happen on the server. The browser never receives password hashes or 2FA secrets.
+  const callServerLogin = async (extra: { totp?: string; backupCode?: string } = {}, creds?: { username: string; password: string }): Promise<ServerLoginResult> => {
+    const body = { username: (creds?.username ?? username).trim(), password: creds?.password ?? pendingPasswordRef.current, ...extra };
+    try {
+      const res = await fetch("/api/auth/verify-login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.success && data.username) {
+        if (supabase && data.supabaseSession?.access_token && data.supabaseSession?.refresh_token) {
+          await supabase.auth.setSession({
+            access_token: data.supabaseSession.access_token,
+            refresh_token: data.supabaseSession.refresh_token,
+          });
+        }
+        if (data.sessionToken) localStorage.setItem("love_server_session_token", data.sessionToken);
+        await startFirebaseSession({ firebaseToken: data.firebaseToken, coupleId: data.coupleId, role: data.role, username: data.username });
+        return { success: true, username: data.username };
+      }
+      return { success: false, requires2fa: !!data.requires2fa, error: data.error, status: res.status };
+    } catch {
+      return { success: false, error: "Could not reach the server. Please try again.", status: 0 };
+    }
+  };
+
+  const registerFailure = (name: string, kind: string, details: string, clientIp: string, unusualLabel: string) => {
+    const nextFailed = failedAttempts + 1;
+    setFailedAttempts(nextFailed);
+    localStorage.setItem("love_login_failed_attempts", nextFailed.toString());
+    if (nextFailed >= configuredMaxAttempts) {
+      const lockoutTime = Date.now() + configuredLockoutSeconds * 1000;
+      setLockoutUntil(lockoutTime);
+      localStorage.setItem("love_login_lockout_until", lockoutTime.toString());
+      const lockoutDetails = `🚨 Account locked out for ${configuredLockoutSeconds}s after ${nextFailed} failed attempts. IP: ${clientIp} | ${unusualLabel}`;
+      logActivity(name || "Unknown User", "security_lockout_triggered", lockoutDetails).catch(() => {});
+      sendTelegramAlert(formatSecurityAlertTelegramMessage(name || "Unknown User", "security_lockout_triggered", lockoutDetails), "security", { targetUsername: name, adminSettings, userAccounts }).catch(() => {});
+      return { locked: true, remaining: 0 };
+    }
+    const failedDetails = `${details} (${nextFailed}/${configuredMaxAttempts}). IP: ${clientIp} | ${unusualLabel}`;
+    logActivity(name || "Unknown User", kind, failedDetails).catch(() => {});
+    sendTelegramAlert(formatSecurityAlertTelegramMessage(name || "Unknown User", kind, failedDetails), "security", { targetUsername: name, adminSettings, userAccounts }).catch(() => {});
+    return { locked: false, remaining: configuredMaxAttempts - nextFailed };
+  };
+
+  const completeLogin = async (name: string) => {
+    const clientIp = await getClientIp();
+    const unusualTime = isUnusualAccessHour();
+    setFailedAttempts(0);
+    setLockoutUntil(0);
+    localStorage.removeItem("love_login_failed_attempts");
+    localStorage.removeItem("love_login_lockout_until");
+    pendingPasswordRef.current = "";
+    if (unusualTime.isUnusual) {
+      logActivity(name, "security_unusual_time_login", `Login detected during unusual off-hours (${unusualTime.label}) from IP: ${clientIp}`).catch(() => {});
+    }
+    sendTelegramAlert(formatSecurityAlertTelegramMessage(name, unusualTime.isUnusual ? "security_unusual_time_login" : "security_login_success", `User '${name}' logged in successfully. IP: ${clientIp} | ${unusualTime.label}`), "security", { targetUsername: name, adminSettings, userAccounts }).catch(() => {});
+    onLoginSuccess(name);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -81,7 +142,6 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, admi
       setError(`Too many failed attempts. Please wait ${lockoutRemaining}s before trying again.`);
       return;
     }
-
     if (!username.trim()) {
       setError("Please enter your beautiful name");
       return;
@@ -92,313 +152,66 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, admi
     }
 
     setIsSubmitting(true);
+    pendingPasswordRef.current = password;
+    const result = await callServerLogin({}, { username, password });
 
-    const inputUserClean = username.trim().toLowerCase();
-    const inputPass = password;
-
-    let isAuthorized = false;
-    let authenticatedUsername = username.trim();
-    let accountWith2FA: TwoFactorPendingAccount | null = null;
-
-    // Secure server-side credential verification via backend proxy (prevents network data leakage)
-    try {
-      const verifyRes = await fetch("/api/auth/verify-login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: username.trim(), password: inputPass }),
-      });
-      const verifyData = await verifyRes.json();
-      if (verifyData.success && verifyData.username) {
-        isAuthorized = true;
-        authenticatedUsername = verifyData.username;
-        if (supabase && verifyData.supabaseSession?.access_token && verifyData.supabaseSession?.refresh_token) {
-          await supabase.auth.setSession({
-            access_token: verifyData.supabaseSession.access_token,
-            refresh_token: verifyData.supabaseSession.refresh_token,
-          });
-        }
-        if (verifyData.sessionToken) {
-          localStorage.setItem("love_server_session_token", verifyData.sessionToken);
-        }
-      }
-    } catch (apiErr) {
-      console.warn("Server auth verification offline fallback:", apiErr);
+    if (result.success && result.username) {
+      await completeLogin(result.username);
+      return;
     }
 
-    // Fallback client-side check if backend proxy is offline
-    if (!isAuthorized) {
-      const adminAccountsDoc = adminSettings.find((s) => s.id === "adminAccounts");
-      const adminAccounts: AdminAccount[] = adminAccountsDoc?.adminAccounts || [];
-      const legacyAdminCreds = adminSettings.find((s) => s.id === "credentials");
-
-      const matchingAdminAccount = adminAccounts.find((a) => a.username.toLowerCase().trim() === inputUserClean);
-      if (matchingAdminAccount?.password) {
-        const isMatch = await verifyPassword(inputPass, matchingAdminAccount.password);
-        if (isMatch) {
-          isAuthorized = true;
-          authenticatedUsername = matchingAdminAccount.username;
-          if (matchingAdminAccount.twoFactorEnabled && matchingAdminAccount.twoFactorSecret) {
-            accountWith2FA = {
-              type: "adminAccount",
-              username: matchingAdminAccount.username,
-              secret: matchingAdminAccount.twoFactorSecret,
-              backupCodes: matchingAdminAccount.twoFactorBackupCodes || [],
-              accountObj: matchingAdminAccount,
-            };
-          }
-        }
-      }
-
-      if (!isAuthorized && legacyAdminCreds?.username && legacyAdminCreds.username.toLowerCase().trim() === inputUserClean) {
-        if (legacyAdminCreds.password && (await verifyPassword(inputPass, legacyAdminCreds.password))) {
-          isAuthorized = true;
-          authenticatedUsername = legacyAdminCreds.username;
-          if (legacyAdminCreds.twoFactorEnabled && legacyAdminCreds.twoFactorSecret) {
-            accountWith2FA = {
-              type: "legacyAdmin",
-              username: legacyAdminCreds.username,
-              secret: legacyAdminCreds.twoFactorSecret,
-              backupCodes: legacyAdminCreds.twoFactorBackupCodes || [],
-              accountObj: legacyAdminCreds,
-            };
-          }
-        }
-      }
-
-      if (!isAuthorized) {
-        const dbUser = userAccounts.find((u) => u.username.toLowerCase().trim() === inputUserClean || u.id.toLowerCase() === inputUserClean || u.id.toLowerCase() === `user_${inputUserClean}`);
-
-        if (dbUser && dbUser.password && (await verifyPassword(inputPass, dbUser.password))) {
-          isAuthorized = true;
-          authenticatedUsername = dbUser.username;
-          if (dbUser.twoFactorEnabled && dbUser.twoFactorSecret) {
-            accountWith2FA = {
-              type: "userAccount",
-              username: dbUser.username,
-              secret: dbUser.twoFactorSecret,
-              backupCodes: dbUser.twoFactorBackupCodes || [],
-              accountObj: dbUser,
-            };
-          }
-        }
-      }
-    }
-
-    const clientIp = await getClientIp();
-    const unusualTime = isUnusualAccessHour();
-
-    if (isAuthorized) {
-      // If the account has Two-Factor Authentication enabled, transition to 2FA Step!
-      if (accountWith2FA) {
-        setIsSubmitting(false);
-        setPending2FA(accountWith2FA);
-        logActivity(authenticatedUsername, "security_2fa_prompted", `Password verified. 2FA verification step prompted for "${authenticatedUsername}". IP: ${clientIp}`).catch(() => {});
-        return;
-      }
-
-      // 2FA is not enabled on this account; proceed with normal login
-      setFailedAttempts(0);
-      setLockoutUntil(0);
-      localStorage.removeItem("love_login_failed_attempts");
-      localStorage.removeItem("love_login_lockout_until");
-
-      if (unusualTime.isUnusual) {
-        logActivity(authenticatedUsername, "security_unusual_time_login", `Login detected during unusual off-hours (${unusualTime.label}) from IP: ${clientIp}`).catch(() => {});
-      }
-
-      // Dispatch Telegram Security Alert for Successful Login
-      sendTelegramAlert(formatSecurityAlertTelegramMessage(authenticatedUsername, unusualTime.isUnusual ? "security_unusual_time_login" : "security_login_success", `User '${authenticatedUsername}' logged in successfully. IP: ${clientIp} | ${unusualTime.label}`), "security", {
-        targetUsername: authenticatedUsername,
-        adminSettings,
-        userAccounts,
-      }).catch(() => {});
-
-      onLoginSuccess(authenticatedUsername);
-    } else {
-      const nextFailed = failedAttempts + 1;
-      setFailedAttempts(nextFailed);
-      localStorage.setItem("love_login_failed_attempts", nextFailed.toString());
-
-      if (nextFailed >= configuredMaxAttempts) {
-        const lockoutTime = Date.now() + configuredLockoutSeconds * 1000;
-        setLockoutUntil(lockoutTime);
-        localStorage.setItem("love_login_lockout_until", lockoutTime.toString());
-        setError(`Too many failed login attempts. Please wait ${configuredLockoutSeconds} seconds.`);
-
-        const lockoutDetails = `🚨 Account locked out for ${configuredLockoutSeconds}s after ${nextFailed} failed password attempts. IP: ${clientIp} | ${unusualTime.label}`;
-        logActivity(username.trim() || "Unknown User", "security_lockout_triggered", lockoutDetails).catch(() => {});
-
-        // Dispatch Telegram Security Alert for Account Lockout
-        sendTelegramAlert(formatSecurityAlertTelegramMessage(username.trim() || "Unknown User", "security_lockout_triggered", lockoutDetails), "security", {
-          targetUsername: username.trim(),
-          adminSettings,
-          userAccounts,
-        }).catch(() => {});
-      } else {
-        const remainingAttempts = configuredMaxAttempts - nextFailed;
-        setError(`Incorrect name or secret password. (${remainingAttempts} attempts remaining)`);
-
-        const failedDetails = `Failed login password attempt (${nextFailed}/${configuredMaxAttempts}). IP: ${clientIp} | ${unusualTime.label}`;
-        logActivity(username.trim() || "Unknown User", "security_failed_login", failedDetails).catch(() => {});
-
-        // Dispatch Telegram Security Alert for Failed Password Attempt
-        sendTelegramAlert(formatSecurityAlertTelegramMessage(username.trim() || "Unknown User", "security_failed_login", failedDetails), "security", {
-          targetUsername: username.trim(),
-          adminSettings,
-          userAccounts,
-        }).catch(() => {});
-      }
+    if (result.requires2fa) {
       setIsSubmitting(false);
+      setPending2FA({ username: username.trim() });
+      logActivity(username.trim(), "security_2fa_prompted", `Password verified. 2FA verification step prompted for "${username.trim()}".`).catch(() => {});
+      return;
     }
-  };
 
-  // Verify TOTP 6-digit code
-  const handleVerifyTOTP = async (code: string): Promise<{ success: boolean; message?: string }> => {
-    if (!pending2FA) return { success: false, message: "No 2FA session found." };
+    pendingPasswordRef.current = "";
+    if (result.status === 429 || result.status === 0 || (result.status && result.status >= 500)) {
+      setError(result.error || "Sign-in is unavailable right now.");
+      setIsSubmitting(false);
+      return;
+    }
 
     const clientIp = await getClientIp();
     const unusualTime = isUnusualAccessHour();
-
-    const verifyResult = await verifyTOTP(code, pending2FA.secret, 1);
-
-    if (verifyResult.valid) {
-      // Successful 2FA verification
-      setFailedAttempts(0);
-      setLockoutUntil(0);
-      localStorage.removeItem("love_login_failed_attempts");
-      localStorage.removeItem("love_login_lockout_until");
-
-      await logActivity(pending2FA.username, "security_2fa_success", `🔐 Two-factor authentication (TOTP) successful for "${pending2FA.username}". IP: ${clientIp} | ${unusualTime.label}`).catch(() => {});
-
-      if (unusualTime.isUnusual) {
-        await logActivity(pending2FA.username, "security_unusual_time_login", `Login detected during unusual off-hours (${unusualTime.label}) from IP: ${clientIp}`).catch(() => {});
-      }
-
-      sendTelegramAlert(formatSecurityAlertTelegramMessage(pending2FA.username, "security_2fa_success", `🔐 Two-factor authentication (TOTP) successful for "${pending2FA.username}". IP: ${clientIp} | ${unusualTime.label}`), "security", {
-        targetUsername: pending2FA.username,
-        adminSettings,
-        userAccounts,
-      }).catch(() => {});
-
-      const userToLogin = pending2FA.username;
-      setPending2FA(null);
-      onLoginSuccess(userToLogin);
-      return { success: true };
-    }
-
-    // Failed TOTP attempt
-    const nextFailed = failedAttempts + 1;
-    setFailedAttempts(nextFailed);
-    localStorage.setItem("love_login_failed_attempts", nextFailed.toString());
-
-    if (nextFailed >= configuredMaxAttempts) {
-      const lockoutTime = Date.now() + configuredLockoutSeconds * 1000;
-      setLockoutUntil(lockoutTime);
-      localStorage.setItem("love_login_lockout_until", lockoutTime.toString());
-      setPending2FA(null);
-      setError(`Too many failed 2FA verification attempts. Locked out for ${configuredLockoutSeconds}s.`);
-
-      const lockoutDetails = `🚨 Account locked out for ${configuredLockoutSeconds}s after ${nextFailed} failed 2FA attempts. IP: ${clientIp} | ${unusualTime.label}`;
-      logActivity(pending2FA.username, "security_lockout_triggered", lockoutDetails).catch(() => {});
-
-      sendTelegramAlert(formatSecurityAlertTelegramMessage(pending2FA.username, "security_lockout_triggered", lockoutDetails), "security", {
-        targetUsername: pending2FA.username,
-        adminSettings,
-        userAccounts,
-      }).catch(() => {});
-
-      return { success: false, message: `Account locked out for ${configuredLockoutSeconds} seconds.` };
-    }
-
-    const remainingAttempts = configuredMaxAttempts - nextFailed;
-    logActivity(pending2FA.username, "security_2fa_failed", `🚨 Failed 2FA TOTP code attempt (${nextFailed}/${configuredMaxAttempts}). IP: ${clientIp} | ${unusualTime.label}`).catch(() => {});
-
-    return {
-      success: false,
-      message: `Invalid 6-digit code. Please verify your authenticator app clock. (${remainingAttempts} attempts remaining)`,
-    };
+    const outcome = registerFailure(username.trim(), "security_failed_login", "Failed login password attempt", clientIp, unusualTime.label);
+    setError(outcome.locked ? `Too many failed login attempts. Please wait ${configuredLockoutSeconds} seconds.` : `Incorrect name or secret password. (${outcome.remaining} attempts remaining)`);
+    setIsSubmitting(false);
   };
 
-  // Verify Single-Use Emergency Recovery Backup Code
-  const handleVerifyBackupCode = async (code: string): Promise<{ success: boolean; message?: string }> => {
+  const verifySecondFactor = async (extra: { totp?: string; backupCode?: string }): Promise<{ success: boolean; message?: string }> => {
     if (!pending2FA) return { success: false, message: "No 2FA session found." };
-
+    const name = pending2FA.username;
+    const result = await callServerLogin(extra, { username: name, password: pendingPasswordRef.current });
+    if (result.success && result.username) {
+      const clientIp = await getClientIp();
+      logActivity(name, extra.backupCode ? "security_backup_code_used" : "security_2fa_success", extra.backupCode ? `🚨 Emergency single-use backup recovery code was used for "${name}". IP: ${clientIp}` : `🔐 Two-factor authentication (TOTP) successful for "${name}". IP: ${clientIp}`).catch(() => {});
+      setPending2FA(null);
+      await completeLogin(result.username);
+      return { success: true };
+    }
+    if (result.status === 429) {
+      return { success: false, message: result.error || "Too many attempts. Try again later." };
+    }
     const clientIp = await getClientIp();
     const unusualTime = isUnusualAccessHour();
-
-    const result = verifyAndConsumeBackupCode(code, pending2FA.backupCodes);
-
-    if (result.valid) {
-      // Consume the code in the database so it cannot be reused
-      try {
-        if (pending2FA.type === "adminAccount") {
-          const adminAccountsDoc = adminSettings.find((s) => s.id === "adminAccounts");
-          const currentList: AdminAccount[] = adminAccountsDoc?.adminAccounts || [];
-          const updatedList = currentList.map((a) => {
-            if (a.id === pending2FA.accountObj.id) {
-              return { ...a, twoFactorBackupCodes: result.remainingCodes };
-            }
-            return a;
-          });
-          await saveAdminSettingDoc({
-            id: "adminAccounts",
-            adminAccounts: updatedList,
-          });
-        } else if (pending2FA.type === "legacyAdmin") {
-          const legacyAdminCreds = adminSettings.find((s) => s.id === "credentials");
-          await saveAdminSettingDoc({
-            ...legacyAdminCreds,
-            id: "credentials",
-            twoFactorBackupCodes: result.remainingCodes,
-          });
-        } else if (pending2FA.type === "userAccount") {
-          await saveUserAccountDoc({
-            ...pending2FA.accountObj,
-            twoFactorBackupCodes: result.remainingCodes,
-          });
-        }
-      } catch (err) {
-        console.error("Failed to update burned backup codes:", err);
-      }
-
-      setFailedAttempts(0);
-      setLockoutUntil(0);
-      localStorage.removeItem("love_login_failed_attempts");
-      localStorage.removeItem("love_login_lockout_until");
-
-      await logActivity(pending2FA.username, "security_backup_code_used", `🚨 Emergency single-use backup recovery code was used to bypass TOTP for "${pending2FA.username}". Code permanently burned (${result.remainingCodes.length} remaining). IP: ${clientIp} | ${unusualTime.label}`).catch(() => {});
-
-      const userToLogin = pending2FA.username;
+    const outcome = registerFailure(name, "security_2fa_failed", extra.backupCode ? "🚨 Failed emergency backup recovery code attempt" : "🚨 Failed 2FA TOTP code attempt", clientIp, unusualTime.label);
+    if (outcome.locked) {
       setPending2FA(null);
-      onLoginSuccess(userToLogin);
-      return { success: true };
-    }
-
-    // Invalid backup code
-    const nextFailed = failedAttempts + 1;
-    setFailedAttempts(nextFailed);
-    localStorage.setItem("love_login_failed_attempts", nextFailed.toString());
-
-    if (nextFailed >= configuredMaxAttempts) {
-      const lockoutTime = Date.now() + configuredLockoutSeconds * 1000;
-      setLockoutUntil(lockoutTime);
-      localStorage.setItem("love_login_lockout_until", lockoutTime.toString());
-      setPending2FA(null);
+      pendingPasswordRef.current = "";
       setError(`Too many failed 2FA verification attempts. Locked out for ${configuredLockoutSeconds}s.`);
-
-      logActivity(pending2FA.username, "security_lockout_triggered", `🚨 Account locked out for ${configuredLockoutSeconds}s after failed recovery code attempt. IP: ${clientIp} | ${unusualTime.label}`).catch(() => {});
-
       return { success: false, message: `Account locked out for ${configuredLockoutSeconds} seconds.` };
     }
-
-    const remainingAttempts = configuredMaxAttempts - nextFailed;
-    logActivity(pending2FA.username, "security_2fa_failed", `🚨 Failed emergency backup recovery code attempt (${nextFailed}/${configuredMaxAttempts}). IP: ${clientIp} | ${unusualTime.label}`).catch(() => {});
-
     return {
       success: false,
-      message: `Invalid or already consumed emergency recovery code. (${remainingAttempts} attempts remaining)`,
+      message: extra.backupCode ? `Invalid or already consumed emergency recovery code. (${outcome.remaining} attempts remaining)` : `Invalid 6-digit code. Please verify your authenticator app clock. (${outcome.remaining} attempts remaining)`,
     };
   };
+
+  const handleVerifyTOTP = (code: string) => verifySecondFactor({ totp: code.trim() });
+  const handleVerifyBackupCode = (code: string) => verifySecondFactor({ backupCode: code.trim() });
 
   return (
     <main id="login_container" className="min-h-screen min-h-[100dvh] w-full flex items-center justify-center bg-neutral-950 text-white relative px-4 overflow-hidden">

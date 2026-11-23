@@ -16,6 +16,7 @@ import {
   subscribeToCelebrationCards,
   saveCelebrationCardDoc
 } from '../lib/syncService';
+import { authHeaders } from '../lib/authHeaders';
 
 interface MusicLoungeProps {
   currentUser?: string;
@@ -378,7 +379,7 @@ export function MusicLounge({
       try {
         const response = await fetch('/api/upload-audio', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders(),
           body: JSON.stringify({
             fileName: selectedFile.name,
             dataUrl: fileBase64,

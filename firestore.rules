@@ -197,119 +197,128 @@ service cloud.firestore {
     // HARDENED COLLECTION ACCESS RULES
     // ==========================================
 
+    // ---- Identity and tenancy come from the server-minted Firebase custom token (claims: coupleId, role, username).
+    function signedIn() { return request.auth != null && request.auth.token.keys().hasAll(['coupleId', 'role', 'username']); }
+    function isAdmin() { return signedIn() && request.auth.token.role == 'admin'; }
+    function canWrite() { return signedIn() && request.auth.token.role in ['admin', 'partner', 'user']; }
+    function me() { return request.auth.token.username; }
+    function sameCouple(data) { return signedIn() && data.get('coupleId', null) == request.auth.token.coupleId; }
+
     match /presence/{username} {
-      allow read: if true;
-      allow create, update: if isValidId(username) && incoming().username.lower() == username.lower() && isValidPresence(incoming());
-      allow delete: if isValidId(username);
+      // Couple-scoped presence: partners see each other, nobody else does.
+      allow read: if isAdmin() || (signedIn() && sameCouple(resource.data));
+      allow create, update: if canWrite() && isValidId(username) && username.lower() == me().lower()
+        && incoming().username.lower() == me().lower() && sameCouple(incoming()) && isValidPresence(incoming());
+      allow delete: if canWrite() && username.lower() == me().lower();
     }
 
-    match /typingStatus/{username} {
-      allow read: if true;
-      allow create, update: if isValidId(username) && incoming().username.lower() == username.lower() && isValidTypingStatus(incoming());
-      allow delete: if isValidId(username);
-    }
-
-    match /notifications/{notificationId} {
-      allow read: if true;
-      allow create, update: if isValidId(notificationId) && incoming().id == notificationId && isValidNotification(incoming());
-      allow delete: if isValidId(notificationId);
-    }
+    // No client code reads or writes these (verified by search); closed.
+    match /typingStatus/{username} { allow read, write: if false; }
+    match /notifications/{notificationId} { allow read, write: if false; }
 
     match /chatGroups/{groupId} {
-      allow read: if true;
-      allow create, update: if isValidId(groupId) && incoming().id == groupId && isValidChatGroup(incoming());
-      allow delete: if isValidId(groupId);
+      allow read: if isAdmin() || (signedIn() && (me() in resource.data.members || me() in resource.data.get('pendingMembers', [])));
+      allow create: if canWrite() && isValidId(groupId) && incoming().id == groupId && incoming().createdBy == me()
+        && me() in incoming().members && isValidChatGroup(incoming());
+      // Participants may update (accept invite, leave, edit); fine-grained group-admin flags stay client-enforced.
+      allow update: if isAdmin() || (canWrite() && (me() in resource.data.members || me() in resource.data.get('pendingMembers', []))
+        && incoming().id == groupId && incoming().createdBy == resource.data.createdBy && isValidChatGroup(incoming()));
+      allow delete: if isAdmin() || (canWrite() && resource.data.createdBy == me());
     }
 
     match /chatMessages/{messageId} {
-      allow read: if true;
-      allow create, update: if isValidId(messageId) && incoming().id == messageId && isValidChatMessage(incoming());
-      allow delete: if isValidId(messageId);
+      allow read: if isAdmin() || (signedIn() && (
+        sameCouple(resource.data)
+        || resource.data.sender == me()
+        || resource.data.get('receiver', null) == me()
+        || resource.data.get('conversationId', null) == 'global'
+        || (resource.data.get('conversationId', '').matches('group_.*')
+            && me() in get(/databases/$(database)/documents/chatGroups/$(resource.data.conversationId)).data.members)));
+      allow create: if canWrite() && isValidId(messageId) && incoming().id == messageId && isValidChatMessage(incoming())
+        && incoming().sender == me() && (isAdmin() || sameCouple(incoming()));
+      allow update: if isAdmin() || (canWrite() && isValidId(messageId) && incoming().id == messageId && isValidChatMessage(incoming())
+        && (sameCouple(resource.data) || resource.data.get('receiver', null) == me() || resource.data.sender == me())
+        && incoming().sender == resource.data.sender);
+      allow delete: if isAdmin() || (canWrite() && resource.data.sender == me());
     }
 
-    match /milestones/{milestoneId} {
-      allow read: if true;
-      allow create, update: if isValidId(milestoneId) && incoming().id == milestoneId && isValidMilestone(incoming());
-      allow delete: if isValidId(milestoneId);
+    match /milestones/{docId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if isAdmin() || (canWrite() && isValidId(docId) && incoming().id == docId && sameCouple(incoming()) && isValidMilestone(incoming()));
+      allow update: if isAdmin() || (canWrite() && sameCouple(resource.data) && sameCouple(incoming()) && incoming().id == docId && isValidMilestone(incoming()));
+      allow delete: if isAdmin() || (canWrite() && sameCouple(resource.data));
     }
 
-    match /datePlans/{datePlanId} {
-      allow read: if true;
-      allow create, update: if isValidId(datePlanId) && incoming().id == datePlanId && isValidDatePlan(incoming());
-      allow delete: if isValidId(datePlanId);
+    match /datePlans/{docId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if isAdmin() || (canWrite() && isValidId(docId) && incoming().id == docId && sameCouple(incoming()) && isValidDatePlan(incoming()));
+      allow update: if isAdmin() || (canWrite() && sameCouple(resource.data) && sameCouple(incoming()) && incoming().id == docId && isValidDatePlan(incoming()));
+      allow delete: if isAdmin() || (canWrite() && sameCouple(resource.data));
     }
 
-    match /memories/{memoryId} {
-      allow read: if true;
-      allow create, update: if isValidId(memoryId) && incoming().id == memoryId && isValidMemory(incoming());
-      allow delete: if isValidId(memoryId);
+    match /memories/{docId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if isAdmin() || (canWrite() && isValidId(docId) && incoming().id == docId && sameCouple(incoming()) && isValidMemory(incoming()));
+      allow update: if isAdmin() || (canWrite() && sameCouple(resource.data) && sameCouple(incoming()) && incoming().id == docId && isValidMemory(incoming()));
+      allow delete: if isAdmin() || (canWrite() && sameCouple(resource.data));
     }
 
-    match /letters/{letterId} {
-      allow read: if true;
-      allow create, update: if isValidId(letterId) && incoming().id == letterId && isValidLoveLetter(incoming());
-      allow delete: if isValidId(letterId);
+    match /letters/{docId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if isAdmin() || (canWrite() && isValidId(docId) && incoming().id == docId && sameCouple(incoming()) && isValidLoveLetter(incoming()));
+      allow update: if isAdmin() || (canWrite() && sameCouple(resource.data) && sameCouple(incoming()) && incoming().id == docId && isValidLoveLetter(incoming()));
+      allow delete: if isAdmin() || (canWrite() && sameCouple(resource.data));
     }
 
-    match /coupleQuestions/{questionId} {
-      allow read: if true;
-      allow create, update: if isValidId(questionId) && incoming().id == questionId && isValidCoupleQuestion(incoming());
-      allow delete: if isValidId(questionId);
+    match /coupleQuestions/{docId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if isAdmin() || (canWrite() && isValidId(docId) && incoming().id == docId && sameCouple(incoming()) && isValidCoupleQuestion(incoming()));
+      allow update: if isAdmin() || (canWrite() && sameCouple(resource.data) && sameCouple(incoming()) && incoming().id == docId && isValidCoupleQuestion(incoming()));
+      allow delete: if isAdmin() || (canWrite() && sameCouple(resource.data));
+    }
+
+    match /celebrationCards/{docId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if isAdmin() || (canWrite() && isValidId(docId) && incoming().id == docId && sameCouple(incoming()) && isValidCelebrationCard(incoming()));
+      allow update: if isAdmin() || (canWrite() && sameCouple(resource.data) && sameCouple(incoming()) && incoming().id == docId && isValidCelebrationCard(incoming()));
+      allow delete: if isAdmin() || (canWrite() && sameCouple(resource.data));
+    }
+
+    match /musicTracks/{docId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if isAdmin() || (canWrite() && isValidId(docId) && incoming().id == docId && sameCouple(incoming()) && isValidMusicTrack(incoming()));
+      allow update: if isAdmin() || (canWrite() && sameCouple(resource.data) && sameCouple(incoming()) && incoming().id == docId && isValidMusicTrack(incoming()));
+      allow delete: if isAdmin() || (canWrite() && sameCouple(resource.data));
+    }
+
+    match /activityLogs/{logId} {
+      allow read: if isAdmin() || sameCouple(resource.data);
+      allow create: if signedIn() && isValidId(logId) && incoming().id == logId && sameCouple(incoming()) && isValidActivityLog(incoming());
+      allow update: if false; // audit logs are immutable
+      allow delete: if isAdmin();
     }
 
     // User accounts: Prevents account takeover, username hijacking, and impersonation of admin
-    match /userAccounts/{userId} {
-      allow read: if true;
-      allow create: if isValidId(userId)
-        && incoming().id == userId
-        && isValidUserAccount(incoming())
-        && incoming().username.lower() != 'admin';
-      allow update: if isValidId(userId)
-        && incoming().id == userId
-        && incoming().id == existing().id
-        && incoming().username.lower() == existing().username.lower()
-        && isValidUserAccount(incoming())
-        && incoming().username.lower() != 'admin';
-      allow delete: if isValidId(userId) && existing().username.lower() != 'admin';
+    // Locked: accounts (password hashes, 2FA secrets) are served only by the authenticated server API.
+    match /userAccounts/{docId} {
+      allow read, write: if false;
     }
 
     // Admin settings: Protected against unauthorized client deletion and ID poisoning
-    match /adminSettings/{settingId} {
-      allow read: if true;
-      allow create, update: if isValidId(settingId) && incoming().id == settingId && isValidAdminSetting(incoming());
-      allow delete: if false; // System admin configurations cannot be deleted by client
+    // Locked: admin credentials and settings are served only by the authenticated server API.
+    match /adminSettings/{docId} {
+      allow read, write: if false;
     }
 
     // Couple tenants: Protected against workspace destruction
-    match /coupleTenants/{coupleId} {
-      allow read: if true;
-      allow create, update: if isValidId(coupleId) && incoming().coupleId == coupleId && isValidCoupleTenant(incoming());
-      allow delete: if false; // Tenant spaces cannot be deleted by client
-    }
-
-    // Activity logs: Tamper-proof append-only audit trail
-    match /activityLogs/{logId} {
-      allow read: if true;
-      allow create: if isValidId(logId) && incoming().id == logId && isValidActivityLog(incoming());
-      allow update: if false; // Existing audit logs are strictly immutable
-      allow delete: if isValidId(logId);
-    }
-
-    match /celebrationCards/{cardId} {
-      allow read: if true;
-      allow create, update: if isValidId(cardId) && incoming().id == cardId && isValidCelebrationCard(incoming());
-      allow delete: if isValidId(cardId);
-    }
-
-    match /musicTracks/{trackId} {
-      allow read: if true;
-      allow create, update: if isValidId(trackId) && incoming().id == trackId && isValidMusicTrack(incoming());
-      allow delete: if isValidId(trackId);
+    // Locked: tenant records are served only by the authenticated server API.
+    match /coupleTenants/{docId} {
+      allow read, write: if false;
     }
 
     // Startup connection ping document (read-only)
     match /_connection_test_metadata_/{docId} {
-      allow read: if true;
+      allow read: if signedIn();
       allow write: if false;
     }
   }

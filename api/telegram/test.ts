@@ -1,4 +1,5 @@
-export default async function handler(req: any, res: any) {
+import { withRole, ADMIN } from "../../server/guards.js";
+async function handler(req: any, res: any) {
   if (req.method !== "POST") {
     return res.status(405).json({ success: false, error: "Method not allowed" });
   }
@@ -44,3 +45,5 @@ export default async function handler(req: any, res: any) {
     return res.status(500).json({ success: false, error: err.message || "Failed to connect to Telegram API" });
   }
 }
+
+export default withRole(ADMIN, handler);

@@ -2,10 +2,12 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
 import { createClient } from "@supabase/supabase-js";
-import { createServerSession, createTemporaryAuthPassword, verifyPassword, verifySecret, verifyServerSession } from "./server/auth";
-import { parseAudioUpload } from "./server/audio";
+import { createServerSession, createTemporaryAuthPassword, verifyPassword, verifySecret, verifyServerSession } from "./server/auth.js";
+import { parseAudioUpload } from "./server/audio.js";
+import { generateDate } from "./server/generateDate.js";
+import { rolesForPath, requireRole } from "./server/guards.js";
+import { adminSettingsGet, adminSettingsPost, changePassword, proxy, stripeCheckoutDisabled, twoFactor, verifyLogin } from "./server/handlers.js";
 
 const app = express();
 const PORT = 3000;
@@ -13,23 +15,22 @@ const PORT = 3000;
 const isProduction = process.env.NODE_ENV === "production";
 const projectRoot = process.cwd();
 
-// Initialize GoogleGenAI server-side with User-Agent header
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || "",
-  httpOptions: {
-    headers: {
-      "User-Agent": "aistudio-build",
-    },
-  },
-});
 
 const supabaseUrl = process.env.VITE_SUPABASE_URL || "";
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || "";
 const supabaseAdmin = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 async function startServer() {
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  app.use(express.json({ limit: "15mb" }));
+  app.use(express.urlencoded({ limit: "15mb", extended: true }));
+
+  // Authorization gate for every /api route (deny by default).
+  app.use("/api", (req, res, next) => {
+    const roles = rolesForPath(req.method, req.path);
+    if (roles === null) return next();
+    if (!requireRole(req, res, roles)) return;
+    next();
+  });
 
   // API health check
   app.get("/api/health", (req, res) => {
@@ -37,402 +38,24 @@ async function startServer() {
   });
 
   // Secure Backend Proxy for Admin Settings
-  app.get("/api/admin-settings", async (req, res) => {
-    const session = verifyServerSession(req.headers["x-server-session"]);
-    if (!session) {
-      return res.status(401).json({ success: false, error: "Authentication required" });
-    }
+  app.get("/api/admin-settings", adminSettingsGet);
 
-    try {
-      if (!supabaseAdmin) {
-        return res.json({ success: true, settings: [] });
-      }
-      const { data, error } = await supabaseAdmin.from("admin_settings").select("*");
-      if (error) {
-        return res.status(500).json({ success: false, error: error.message });
-      }
-      const settings = (data || []).map((setting: any) => {
-        if (session.role === "admin") return setting;
-        const { password, username, adminAccounts, credentials, ...safeSetting } = setting;
-        return safeSetting;
-      });
-      return res.json({ success: true, settings });
-    } catch (err: any) {
-      return res.status(500).json({ success: false, error: err.message });
-    }
-  });
-
-  app.post("/api/admin-settings", async (req, res) => {
-    const session = verifyServerSession(req.headers["x-server-session"]);
-    if (!session) {
-      return res.status(401).json({ success: false, error: "Authentication required" });
-    }
-    if (session.role !== "admin") {
-      return res.status(403).json({ success: false, error: "Administrator access required" });
-    }
-
-    try {
-      if (!supabaseAdmin) {
-        return res.json({ success: true });
-      }
-      const setting = req.body;
-      const { error } = await supabaseAdmin.from("admin_settings").upsert(setting);
-      if (error) {
-        return res.status(500).json({ success: false, error: error.message });
-      }
-      return res.json({ success: true });
-    } catch (err: any) {
-      return res.status(500).json({ success: false, error: err.message });
-    }
-  });
+  app.post("/api/admin-settings", adminSettingsPost);
 
   // Secure Backend Proxy for All Supabase Database Operations
-  app.post("/api/proxy", async (req, res) => {
-    const sessionToken = req.headers["x-server-session"] || req.headers["authorization"]?.replace("Bearer ", "");
-    const session = verifyServerSession(sessionToken);
-    if (!session) {
-      return res.status(401).json({ success: false, error: "Authentication required" });
-    }
-
-    try {
-      if (!supabaseAdmin) {
-        return res.status(500).json({ success: false, error: "Database service unavailable" });
-      }
-
-      const { table, action, select, filters, order, data, options, single, count, head } = req.body;
-      if (!table || !action) {
-        return res.status(400).json({ success: false, error: "Missing table or action" });
-      }
-
-      let query = supabaseAdmin.from(table);
-      let q: any;
-
-      if (action === "select") {
-        q = query.select(select || "*", count ? { count: count, head: !!head } : undefined);
-        if (Array.isArray(filters)) {
-          for (const f of filters) {
-            if (f.operator === "eq") q = q.eq(f.column, f.value);
-            else if (f.operator === "neq") q = q.neq(f.column, f.value);
-            else if (f.operator === "ilike") q = q.ilike(f.column, f.value);
-            else if (f.operator === "in") q = q.in(f.column, f.value);
-          }
-        }
-        if (order) {
-          q = q.order(order.column, { ascending: order.ascending ?? true });
-        }
-        if (options?.limit) {
-          q = q.limit(options.limit);
-        }
-        if (single) {
-          q = q.single();
-        }
-        const result = await q;
-        let responseData = result.data;
-        if (!result.error && responseData && table === "user_accounts" && session.role !== "admin") {
-          if (Array.isArray(responseData)) {
-            responseData = responseData.map((acc: any) => {
-              const { password, two_factor_secret, two_factor_backup_codes, ...safeAcc } = acc;
-              return safeAcc;
-            });
-          } else if (typeof responseData === "object" && responseData !== null) {
-            const { password, two_factor_secret, two_factor_backup_codes, ...safeAcc } = responseData;
-            responseData = safeAcc;
-          }
-        }
-        return res.json({ success: !result.error, data: responseData, error: result.error?.message, count: result.count });
-      } else if (action === "insert" || action === "upsert") {
-        let currentPayload = typeof data === "object" && data !== null ? { ...data } : data;
-        let result: any;
-        let success = false;
-        let lastError = "";
-
-        for (let attempt = 0; attempt < 6; attempt++) {
-          let q: any = query[action](currentPayload, action === "upsert" && options?.onConflict ? { onConflict: options.onConflict } : undefined);
-          if (options?.select) q = q.select(options.select);
-          result = await q;
-
-          if (!result.error) {
-            success = true;
-            break;
-          }
-
-          lastError = result.error.message || String(result.error);
-
-          // 1. Check missing column error
-          const colMatch = lastError.match(/Could not find the '([^']+)' column/i);
-          if (colMatch && colMatch[1] && typeof currentPayload === "object" && currentPayload !== null && colMatch[1] in currentPayload) {
-            delete currentPayload[colMatch[1]];
-            continue;
-          }
-
-          // 2. Foreign key constraint fallback
-          if ((lastError.includes("foreign key constraint") || lastError.includes("fkey")) && typeof currentPayload === "object" && currentPayload !== null && "created_by" in currentPayload && currentPayload.created_by !== null) {
-            currentPayload.created_by = null;
-            continue;
-          }
-
-          // 3. Fallback for missing couple_id column
-          if (lastError.includes("couple_id") && typeof currentPayload === "object" && currentPayload !== null && "couple_id" in currentPayload) {
-            delete currentPayload.couple_id;
-            continue;
-          }
-
-          break;
-        }
-
-        if (!success) {
-          return res.json({ success: false, error: lastError });
-        }
-        return res.json({ success: true, data: result.data });
-      } else if (action === "update") {
-        let queryUpd: any = query.update(data);
-        if (Array.isArray(filters)) {
-          for (const f of filters) {
-            if (f.operator === "eq") queryUpd = queryUpd.eq(f.column, f.value);
-            else if (f.operator === "ilike") queryUpd = queryUpd.ilike(f.column, f.value);
-          }
-        }
-        const result = await queryUpd;
-        return res.json({ success: !result.error, data: result.data, error: result.error?.message });
-      } else if (action === "delete") {
-        let queryDel: any = query.delete();
-        if (Array.isArray(filters)) {
-          for (const f of filters) {
-            if (f.operator === "eq") queryDel = queryDel.eq(f.column, f.value);
-          }
-        }
-        const result = await queryDel;
-        return res.json({ success: !result.error, data: result.data, error: result.error?.message });
-      } else {
-        return res.status(400).json({ success: false, error: "Invalid action" });
-      }
-    } catch (err: any) {
-      console.error("Supabase proxy execution error:", err);
-      return res.status(500).json({ success: false, error: err.message || "Server error in database proxy" });
-    }
-  });
+  app.post("/api/proxy", proxy);
 
   // Secure Server-Side Login Verification Endpoint (Prevents network data exposure before login)
-  app.post("/api/auth/verify-login", async (req, res) => {
-    try {
-      const { username, password } = req.body;
-      if (!username || !password) {
-        return res.status(400).json({ success: false, error: "Please enter your name and secret password" });
-      }
-
-      const cleanUser = username.trim().toLowerCase();
-      const inputPass = password;
-
-      if (!supabaseAdmin) {
-        return res.json({ success: false, error: "Database service unavailable" });
-      }
-
-      const [adminRes, userRes] = await Promise.all([supabaseAdmin.from("admin_settings").select("*"), supabaseAdmin.from("user_accounts").select("*")]);
-
-      const adminRows = adminRes.data || [];
-      const userRows = userRes.data || [];
-
-      let isAuthorized = false;
-      let authenticatedUsername = username.trim();
-      let authenticatedCoupleId = "couple_default";
-      let authenticatedRole: "admin" | "partner" | "guest" | "user" = "user";
-
-      // 1. Check admin accounts
-      const adminAccountsDoc = adminRows.find((s: any) => s.id === "adminAccounts");
-      const adminAccounts = adminAccountsDoc?.adminAccounts || [];
-      const matchingAdmin = adminAccounts.find((a: any) => a.username?.toLowerCase().trim() === cleanUser);
-
-      if (matchingAdmin?.password) {
-        if (await verifyPassword(inputPass, matchingAdmin.password)) {
-          isAuthorized = true;
-          authenticatedUsername = matchingAdmin.username;
-          authenticatedCoupleId = matchingAdmin.coupleId || matchingAdmin.couple_id || "couple_default";
-          authenticatedRole = "admin";
-        }
-      }
-
-      // 1b. Check legacy admin credentials
-      const legacyCreds = adminRows.find((s: any) => s.id === "credentials");
-      if (!isAuthorized && legacyCreds?.username?.toLowerCase().trim() === cleanUser && legacyCreds.password) {
-        if (await verifyPassword(inputPass, legacyCreds.password)) {
-          isAuthorized = true;
-          authenticatedUsername = legacyCreds.username;
-          authenticatedCoupleId = legacyCreds.coupleId || legacyCreds.couple_id || "couple_default";
-          authenticatedRole = "admin";
-        }
-      }
-
-      // 2. Check user accounts
-      if (!isAuthorized) {
-        const dbUser = userRows.find((u: any) => u.username?.toLowerCase().trim() === cleanUser || u.id?.toLowerCase() === cleanUser || u.id?.toLowerCase() === `user_${cleanUser}`);
-
-        if (dbUser?.password && (await verifyPassword(inputPass, dbUser.password))) {
-          isAuthorized = true;
-          authenticatedUsername = dbUser.username;
-          authenticatedCoupleId = dbUser.couple_id || dbUser.coupleId || "couple_default";
-          authenticatedRole = dbUser.role === "admin" ? "admin" : dbUser.role === "guest" ? "guest" : "partner";
-        }
-      }
-
-      if (isAuthorized) {
-        const serverSession = createServerSession({
-          username: authenticatedUsername,
-          coupleId: authenticatedCoupleId,
-          role: authenticatedRole,
-        });
-
-        let supabaseSession: any = null;
-        if (supabaseAdmin) {
-          const authEmail = `${cleanUser}@ourhome.local`;
-          const temporaryPassword = createTemporaryAuthPassword();
-          const metadata = {
-            app_metadata: {
-              couple_id: authenticatedCoupleId,
-              role: authenticatedRole,
-              username: authenticatedUsername,
-            },
-          };
-
-          const { data: existingUsers } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
-          const existingUser = existingUsers?.users?.find((user: any) => user.email === authEmail);
-
-          if (existingUser) {
-            await supabaseAdmin.auth.admin.updateUserById(existingUser.id, {
-              password: temporaryPassword,
-              ...metadata,
-              email_confirm: true,
-            });
-          } else {
-            await supabaseAdmin.auth.admin.createUser({
-              email: authEmail,
-              password: temporaryPassword,
-              email_confirm: true,
-              ...metadata,
-            });
-          }
-
-          const authResult = await supabaseAdmin.auth.signInWithPassword({
-            email: authEmail,
-            password: temporaryPassword,
-          });
-          supabaseSession = authResult.data.session;
-        }
-
-        return res.json({
-          success: true,
-          username: authenticatedUsername,
-          sessionToken: serverSession,
-          supabaseSession,
-        });
-      } else {
-        return res.json({ success: false, error: "Incorrect name or secret password." });
-      }
-    } catch (err: any) {
-      console.error("Server login verification error:", err);
-      return res.status(500).json({ success: false, error: err.message || "Authentication error" });
-    }
-  });
+  app.post("/api/auth/verify-login", verifyLogin);
+  app.post("/api/auth/change-password", changePassword);
+  app.post("/api/auth/two-factor", twoFactor);
 
   // AI Date Night Itinerary Generator Endpoint (Pro Feature)
-  app.post("/api/generate-date", async (req, res) => {
-    try {
-      const { budget, mood, location, duration, occasion } = req.body;
-
-      const prompt = `Design a romantic, memorable, and creative date night itinerary for a couple.
-Occasion: ${occasion || "Romantic Date"}
-Budget: ${budget || "Flexible"}
-Mood/Vibe: ${mood || "Cozy & Romantic"}
-Location/Setting: ${location || "Local city"}
-Duration: ${duration || "Evening (3-4 hours)"}
-
-Return a structured JSON object containing:
-- "title": a captivating date title
-- "category": one of ["dinner", "adventure", "home", "budget", "other"]
-- "description": a warm 2-3 sentence overview of why this date is special
-- "theme": a 2-4 word aesthetic theme
-- "cost": one of ["Free", "$", "$$", "$$$"]
-- "checklist": an array of 4-6 step-by-step checklist items with "id" and "text"
-- "notes": romantic advice or secret tips for making it unforgettable`;
-
-      if (process.env.GEMINI_API_KEY) {
-        const response = await ai.models.generateContent({
-          model: "gemini-3.6-flash",
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                category: { type: Type.STRING },
-                description: { type: Type.STRING },
-                theme: { type: Type.STRING },
-                cost: { type: Type.STRING },
-                checklist: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      id: { type: Type.STRING },
-                      text: { type: Type.STRING },
-                    },
-                    required: ["id", "text"],
-                  },
-                },
-                notes: { type: Type.STRING },
-              },
-              required: ["title", "category", "description", "checklist"],
-            },
-          },
-        });
-
-        const data = JSON.parse(response.text || "{}");
-        return res.json({ success: true, plan: data });
-      } else {
-        // Fallback structured date plan generator if GEMINI_API_KEY is not set yet
-        const fallbackPlan = {
-          title: `${mood || "Romantic"} Candlelight ${occasion || "Evening"}`,
-          category: budget === "Free" || budget === "$" ? "home" : "dinner",
-          description: `An intimate, handcrafted ${mood?.toLowerCase() || "romantic"} experience curated specifically for your setting at ${location || "home"}. Enjoy quality uninterrupted time together.`,
-          theme: `${mood || "Cozy"} Elegance`,
-          cost: budget || "$$",
-          checklist: [
-            { id: "1", text: "Set up soft background acoustic music & warm ambient lighting" },
-            { id: "2", text: `Prepare a special ${budget === "Free" ? "homemade treat" : "dinner reservation"}` },
-            { id: "3", text: "Put away mobile phones in a memory box for complete focus" },
-            { id: "4", text: "Exchange a surprise written Love Note or memory card" },
-          ],
-          notes: "Pro Tip: Take a candid photo during dinner to save in your Memory Vault Scrapbook!",
-        };
-        return res.json({ success: true, plan: fallbackPlan, isFallback: true });
-      }
-    } catch (err: any) {
-      console.error("Error generating AI date itinerary:", err);
-      return res.status(500).json({ success: false, error: err.message || "Failed to generate date plan" });
-    }
-  });
+  app.post("/api/generate-date", generateDate);
 
   // Stripe Checkout Session Endpoint (Simulated / Real Handler)
-  app.post("/api/stripe/checkout", async (req, res) => {
-    try {
-      const { plan, coupleId, email, promoCode } = req.body;
-      const checkoutId = "cs_live_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8);
-
-      // Simulate successful Stripe checkout session
-      res.json({
-        success: true,
-        sessionId: checkoutId,
-        url: `#stripe-checkout-success?session=${checkoutId}`,
-        plan: plan || "pro",
-        amount: promoCode === "LOVE50" ? 2.49 : plan === "annual" ? 39.99 : 4.99,
-        currency: "usd",
-        status: "complete",
-        customerEmail: email || "couple@ourhome.app",
-      });
-    } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
-    }
-  });
+  // Payments are not implemented: fail closed instead of faking a completed checkout.
+  app.post("/api/stripe/checkout", stripeCheckoutDisabled);
 
   // Telegram Senders Cache & Memory Buffer
   interface TelegramCapturedSender {

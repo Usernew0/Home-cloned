@@ -8,8 +8,30 @@ export function hashPassword(password: string): string {
   return `${PASSWORD_HASH_PREFIX}${hash}`;
 }
 
+export const SCRYPT_PREFIX = "scrypt_v1:";
+
+/** Per-password random salt, memory-hard. Format: scrypt_v1:<saltHex>:<hashHex> */
+export function hashPasswordScrypt(password: string): string {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(password, salt, 64);
+  return `${SCRYPT_PREFIX}${salt.toString("hex")}:${hash.toString("hex")}`;
+}
+
+/** True when the stored value is legacy (plaintext or static-salt sha256) and should be upgraded after a successful login. */
+export function needsRehash(storedPassword: string): boolean {
+  return !!storedPassword && !storedPassword.startsWith(SCRYPT_PREFIX);
+}
+
 export async function verifyPassword(inputPassword: string, storedPassword: string): Promise<boolean> {
-  if (!storedPassword) return false;
+  if (!storedPassword || typeof inputPassword !== "string") return false;
+
+  if (storedPassword.startsWith(SCRYPT_PREFIX)) {
+    const [saltHex, hashHex] = storedPassword.slice(SCRYPT_PREFIX.length).split(":");
+    if (!saltHex || !hashHex) return false;
+    const expected = Buffer.from(hashHex, "hex");
+    const candidate = crypto.scryptSync(inputPassword, Buffer.from(saltHex, "hex"), expected.length);
+    return expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate);
+  }
 
   if (storedPassword.startsWith(PASSWORD_HASH_PREFIX)) {
     const calculated = hashPassword(inputPassword);
@@ -39,8 +61,30 @@ export interface ServerSessionPayload {
   expiresAt: number;
 }
 
-function getSessionSecret(): string {
-  return process.env.SERVER_SESSION_SECRET || "development-only-session-secret-change-me";
+const DEV_SESSION_SECRET = "development-only-session-secret-change-me";
+
+export function isProductionRuntime(): boolean {
+  return process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
+}
+
+/**
+ * Fail closed: in production (or on Vercel) a strong SERVER_SESSION_SECRET is mandatory.
+ * The public development fallback is only available outside production.
+ */
+export function getSessionSecret(): string {
+  const configured = process.env.SERVER_SESSION_SECRET;
+  if (configured && configured.length >= 32) return configured;
+  if (!isProductionRuntime() && !configured) return DEV_SESSION_SECRET;
+  throw new Error("SERVER_SESSION_SECRET is missing or shorter than 32 characters");
+}
+
+export function isSessionSecretConfigured(): boolean {
+  try {
+    getSessionSecret();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function createServerSession(payload: Omit<ServerSessionPayload, "expiresAt">, durationMinutes = 480): string {
@@ -58,7 +102,13 @@ export function verifyServerSession(token: unknown): ServerSessionPayload | null
   const [encoded, signature, extra] = token.split(".");
   if (!encoded || !signature || extra) return null;
 
-  const expected = crypto.createHmac("sha256", getSessionSecret()).update(encoded).digest("base64url");
+  let secret: string;
+  try {
+    secret = getSessionSecret();
+  } catch {
+    return null;
+  }
+  const expected = crypto.createHmac("sha256", secret).update(encoded).digest("base64url");
   const receivedBuffer = Buffer.from(signature);
   const expectedBuffer = Buffer.from(expected);
   if (receivedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) return null;

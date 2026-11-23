@@ -924,7 +924,8 @@ export function subscribeToUserAccounts(callback: (data: UserAccount[]) => void)
 
   if (isSupabaseConfigured && supabase) {
     const fetchAccounts = async () => {
-      const { data, error } = await supabase.from("user_accounts").select("*");
+      // Read through the server so password hashes and 2FA secrets are never sent to non-admin browsers.
+      const { data, error } = await proxyCall({ table: "user_accounts", action: "select", select: "*" });
 
       if (!error && data) {
         const mapped = data.map((item) => mapFromDb<UserAccount>(item));
@@ -976,10 +977,13 @@ export async function saveUserAccountDoc(user: UserAccount) {
     updatedList = [...current, userWithCouple];
   }
 
-  storage.setUserAccounts(updatedList);
-  notifyUserAccountListeners(updatedList);
+  // Never keep a plaintext password in the browser. The server hashes it on write.
+  const localSafe = (list: UserAccount[]) => list.map((u) => (u.id === userWithCouple.id ? { ...u, password: current[existingIdx]?.password || "" } : u));
+  const safeList = localSafe(updatedList);
+  storage.setUserAccounts(safeList);
+  notifyUserAccountListeners(safeList);
 
-  await saveFirestoreUserAccountDoc(userWithCouple);
+  await saveFirestoreUserAccountDoc({ ...userWithCouple, password: "" });
 
   if (isSupabaseConfigured && supabase) {
     const dbPayload = mapToDb(userWithCouple);

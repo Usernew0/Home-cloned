@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import { Sparkles, Check, Crown, Shield, Zap, CreditCard, X, ArrowRight, Lock, CheckCircle2, Ticket, Tag, AlertCircle } from 'lucide-react';
 import { SubscriptionPlan, PromoCode, DEFAULT_PROMO_CODES, AdminSetting } from '../types';
 import { saveAdminSettingDoc } from '../lib/supabaseService';
+import { authHeaders } from '../lib/authHeaders';
 
 interface SubscriptionModalProps {
   isOpen: boolean;
@@ -58,6 +59,7 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({
   const [expiry, setExpiry] = useState('12/28');
   const [cvc, setCvc] = useState('888');
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -135,7 +137,7 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({
     try {
       const response = await fetch('/api/stripe/checkout', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({
           planId: targetPlan.id,
           planName: targetPlan.name,
@@ -143,24 +145,26 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({
           email: 'couple@ourhome.app'
         })
       });
-      await response.json().catch(() => ({ success: true }));
-      setTimeout(() => {
+      const data = await response.json().catch(() => ({ success: false }));
+      // Fail closed: only a verified successful checkout may activate a plan.
+      if (!response.ok || !data.success || data.status !== 'complete') {
         setIsProcessing(false);
-        setSuccessMessage(`🎉 ${targetPlan.name} Activated! Your couple workspace is now upgraded to ${targetPlan.name}.`);
-        onUpgradeSuccess(targetPlan.id);
-        setTimeout(() => {
-          setSuccessMessage(null);
-          onClose();
-        }, 2200);
-      }, 1000);
-    } catch (err) {
+        setSuccessMessage(null);
+        setCheckoutError(data.error || 'Payment is not available right now. Your plan was not changed.');
+        return;
+      }
+      setCheckoutError(null);
       setIsProcessing(false);
-      setSuccessMessage(`🎉 ${targetPlan.name} Activated! Your couple workspace is now upgraded.`);
+      setSuccessMessage(`${targetPlan.name} activated.`);
       onUpgradeSuccess(targetPlan.id);
       setTimeout(() => {
         setSuccessMessage(null);
         onClose();
       }, 2200);
+    } catch (err) {
+      setIsProcessing(false);
+      setSuccessMessage(null);
+      setCheckoutError('Could not reach the payment service. Your plan was not changed.');
     }
   };
 
@@ -245,6 +249,9 @@ export const SubscriptionModal: React.FC<SubscriptionModalProps> = ({
           <X className="w-5 h-5" />
         </button>
 
+        {checkoutError && (
+          <div role="alert" className="mx-6 mt-4 p-3 rounded-xl border border-rose-500/40 bg-rose-500/10 text-rose-200 text-sm">{checkoutError}</div>
+        )}
         {successMessage ? (
           <div className="py-12 text-center space-y-4">
             <div className="w-16 h-16 bg-rose-500/20 text-rose-400 rounded-full flex items-center justify-center mx-auto border border-rose-500/40 animate-bounce">

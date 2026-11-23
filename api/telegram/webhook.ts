@@ -1,10 +1,11 @@
-import { createClient } from "@supabase/supabase-js";
+import { isProductionRuntime, verifySecret } from "../../server/auth.js";
+import { lazySupabase } from "../../server/supabaseLazy.js";
 
 // ---------------------------------------------------------------------------
 // Supabase client (server side)
 // Prefers a non-VITE service role key; falls back to the VITE_ variables.
 // ---------------------------------------------------------------------------
-const supabase = createClient(process.env.VITE_SUPABASE_URL!, (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY)!);
+const supabase = lazySupabase;
 
 // ---------------------------------------------------------------------------
 // Firestore via REST (no service account, no extra npm package)
@@ -216,8 +217,9 @@ export default async function handler(req: any, res: any) {
   }
 
   // Optional: verify the request really comes from Telegram
+  // Fail closed: the webhook secret is mandatory in production.
   const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (secret && req.headers["x-telegram-bot-api-secret-token"] !== secret) {
+  if (!verifySecret(req.headers["x-telegram-bot-api-secret-token"], secret, isProductionRuntime())) {
     return res.status(401).json({ ok: false });
   }
 

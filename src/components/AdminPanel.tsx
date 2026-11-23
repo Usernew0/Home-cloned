@@ -107,6 +107,7 @@ import { HorizontalScrollWrapper } from "./HorizontalScrollWrapper";
 import { MilestonesCountdownManager } from "./MilestonesCountdownManager";
 import { SecurityLogsDashboard } from "./SecurityLogsDashboard";
 import { TwoFactorSetupModal } from "./TwoFactorSetupModal";
+import { changeTwoFactor } from "../lib/twoFactorApi";
 import {
   saveUserAccountDoc,
   deleteUserAccountDoc,
@@ -138,6 +139,7 @@ import {
 import { isSupabaseConfigured } from "../lib/supabase";
 import { isFirestoreOnline } from "../lib/firebase";
 import { hashPassword } from "../utils/crypto";
+import { authHeaders } from '../lib/authHeaders';
 
 export const SUPABASE_SCHEMA_FIX_SQL = `-- COMPLETE ALL-IN-ONE SUPABASE SCHEMA SETUP SCRIPT
 -- Paste into Supabase Dashboard -> SQL Editor and click "Run"
@@ -1358,7 +1360,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
 
         const response = await fetch("/api/upload-audio", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders(),
           body: JSON.stringify({
             fileName: file.name,
             dataUrl: base64Data,
@@ -2844,7 +2846,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
 
     setIsSyncing(true);
     try {
-      const uPass = await hashPassword(rawPass);
+      const uPass = rawPass; // plaintext over TLS; the server hashes it
       let coupleId = `couple_${Date.now()}`;
       let partnerAccount: UserAccount | undefined;
 
@@ -2912,14 +2914,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
     if (!editingUser) return;
     const rawPass = editingPassword.trim();
 
-    if (!rawPass) {
-      setUserErrorMsg("Password cannot be empty.");
-      return;
-    }
-
     setIsSyncing(true);
     try {
-      const uPass = await hashPassword(rawPass);
+      const uPass = rawPass; // blank keeps the current password; otherwise the server hashes it
       const newCoupleId = editingUserCoupleId || editingUser.coupleId || `couple_${Date.now()}`;
       const oldCoupleId = editingUser.coupleId;
       const updated: UserAccount = {
@@ -3070,7 +3067,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
       return;
     }
 
-    const hashedAdminPass = newAdminPass.trim() ? await hashPassword(newAdminPass.trim()) : "";
+    const hashedAdminPass = newAdminPass.trim(); // plaintext over TLS; the server hashes it
 
     const newAcc: AdminAccount = {
       id: `admin_${Date.now()}`,
@@ -3106,7 +3103,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
     const updated = await Promise.all(
       adminAccountsList.map(async (a) => {
         if (a.id === editingAdmin.id) {
-          const pass = editAdminPass.trim() !== "" ? await hashPassword(editAdminPass.trim()) : a.password;
+          const pass = editAdminPass.trim() !== "" ? editAdminPass.trim() : ""; // blank keeps the stored password server-side
           return {
             ...a,
             username: cleanUser,
@@ -3170,74 +3167,26 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
     });
   };
 
-  const handleSave2FA = async (newSecret: string, newBackupCodes: string[]) => {
+  const handleSave2FA = async (newSecret: string, newBackupCodes: string[], enrollCode: string) => {
     if (!twoFactorModalAccount) return;
     const currentAdmin = localStorage.getItem("love_app_username") || "Admin";
-
-    if (twoFactorModalAccount.type === "admin") {
-      const updated = adminAccountsList.map((a) => {
-        if (a.id === twoFactorModalAccount.id || a.username.toLowerCase() === twoFactorModalAccount.username.toLowerCase()) {
-          return {
-            ...a,
-            twoFactorEnabled: true,
-            twoFactorSecret: newSecret,
-            twoFactorBackupCodes: newBackupCodes,
-            twoFactorCreatedAt: new Date().toISOString(),
-          };
-        }
-        return a;
-      });
-      await handleSaveAdminAccountsList(updated, `Activated Two-Factor Authentication (TOTP RFC 6238) for admin "${twoFactorModalAccount.username}".`);
-      setTwoFactorModalAccount((prev) => (prev ? { ...prev, enabled: true, secret: newSecret, backupCodes: newBackupCodes } : null));
-    } else {
-      const targetUser = userAccounts.find((u) => u.id === twoFactorModalAccount.id || u.username.toLowerCase() === twoFactorModalAccount.username.toLowerCase());
-      if (targetUser) {
-        const updatedUser: UserAccount = {
-          ...targetUser,
-          twoFactorEnabled: true,
-          twoFactorSecret: newSecret,
-          twoFactorBackupCodes: newBackupCodes,
-          twoFactorCreatedAt: new Date().toISOString(),
-        };
-        await saveUserAccountDoc(updatedUser);
-        await logActivity(currentAdmin, "security_2fa_enabled", `Activated Two-Factor Authentication (TOTP RFC 6238) for user "${targetUser.username}".`);
-        setTwoFactorModalAccount((prev) => (prev ? { ...prev, enabled: true, secret: newSecret, backupCodes: newBackupCodes } : null));
-      }
-    }
+    // The server only lets an account enrol itself, after re-authentication.
+    await changeTwoFactor("enable", {
+      secret: newSecret,
+      backupCodes: newBackupCodes,
+      enrollCode,
+      targetUsername: twoFactorModalAccount.username,
+      targetType: twoFactorModalAccount.type,
+    });
+    await logActivity(currentAdmin, "security_2fa_enabled", `Activated Two-Factor Authentication (TOTP RFC 6238) for "${twoFactorModalAccount.username}".`);
+    setTwoFactorModalAccount((prev) => (prev ? { ...prev, enabled: true, secret: "", backupCodes: newBackupCodes } : null));
   };
 
   const handleDisable2FA = async () => {
     if (!twoFactorModalAccount) return;
     const currentAdmin = localStorage.getItem("love_app_username") || "Admin";
-
-    if (twoFactorModalAccount.type === "admin") {
-      const updated = adminAccountsList.map((a) => {
-        if (a.id === twoFactorModalAccount.id || a.username.toLowerCase() === twoFactorModalAccount.username.toLowerCase()) {
-          return {
-            ...a,
-            twoFactorEnabled: false,
-            twoFactorSecret: "",
-            twoFactorBackupCodes: [],
-            twoFactorCreatedAt: "",
-          };
-        }
-        return a;
-      });
-      await handleSaveAdminAccountsList(updated, `Disabled Two-Factor Authentication for admin "${twoFactorModalAccount.username}".`);
-    } else {
-      const targetUser = userAccounts.find((u) => u.id === twoFactorModalAccount.id || u.username.toLowerCase() === twoFactorModalAccount.username.toLowerCase());
-      if (targetUser) {
-        const updatedUser: UserAccount = {
-          ...targetUser,
-          twoFactorEnabled: false,
-          twoFactorSecret: "",
-          twoFactorBackupCodes: [],
-          twoFactorCreatedAt: "",
-        };
-        await saveUserAccountDoc(updatedUser);
-        await logActivity(currentAdmin, "security_2fa_disabled", `Disabled Two-Factor Authentication for user "${targetUser.username}".`);
-      }
-    }
+    await changeTwoFactor("disable", { targetUsername: twoFactorModalAccount.username, targetType: twoFactorModalAccount.type });
+    await logActivity(currentAdmin, "security_2fa_disabled", `Disabled Two-Factor Authentication for "${twoFactorModalAccount.username}".`);
     setTwoFactorModalAccount(null);
   };
 

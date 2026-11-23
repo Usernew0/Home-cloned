@@ -5,6 +5,7 @@
 
 const SESSION_SALT = "OurHome_Security_Salt_2026_SecureSessionToken";
 const HASH_PREFIX = "sha256_v1:";
+const SERVER_HASH_PREFIX = "scrypt_v1:"; // written by the server; verified server-side only
 
 /**
  * Computes a SHA-256 hexadecimal hash with a secure salt
@@ -12,7 +13,7 @@ const HASH_PREFIX = "sha256_v1:";
 export async function hashPassword(plainText: string, salt: string = "OurHome_Secret_Salt"): Promise<string> {
   if (!plainText) return "";
   // If it's already hashed, don't re-hash
-  if (plainText.startsWith(HASH_PREFIX)) return plainText;
+  if (plainText.startsWith(HASH_PREFIX) || plainText.startsWith(SERVER_HASH_PREFIX)) return plainText;
 
   const encoder = new TextEncoder();
   const data = encoder.encode(`${salt}:${plainText}:${salt}`);
@@ -27,7 +28,7 @@ export async function hashPassword(plainText: string, salt: string = "OurHome_Se
  */
 export function isHashedPassword(password: string): boolean {
   if (!password) return false;
-  return password.startsWith(HASH_PREFIX);
+  return password.startsWith(HASH_PREFIX) || password.startsWith(SERVER_HASH_PREFIX);
 }
 
 /**

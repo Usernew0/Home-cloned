@@ -22,7 +22,8 @@ import {
 import { UserAccount, CoupleTenant, AdminSetting } from '../types';
 import { saveUserAccountDoc, saveCoupleTenantDoc, logActivity, saveChatMessageDoc } from '../lib/syncService';
 import { TwoFactorSetupModal } from './TwoFactorSetupModal';
-import { hashPassword, verifyPassword } from '../utils/crypto';
+import { changeTwoFactor } from '../lib/twoFactorApi';
+import { authHeaders } from '../lib/authHeaders';
 import { useTelegramWhitelistSync } from '../hooks/useTelegramWhitelistSync';
 
 interface UserProfileModalProps {
@@ -116,40 +117,20 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   // 2FA Setup Modal State
   const [is2FAModalOpen, setIs2FAModalOpen] = useState(false);
 
-  const handleSaveUser2FA = async (newSecret: string, newBackupCodes: string[]) => {
-    const targetAcc = userAccount || userAccounts.find(u => u.username?.toLowerCase().trim() === currentUsername.toLowerCase().trim());
-    if (targetAcc) {
-      const updatedUser: UserAccount = {
-        ...targetAcc,
-        twoFactorEnabled: true,
-        twoFactorSecret: newSecret,
-        twoFactorBackupCodes: newBackupCodes,
-        twoFactorCreatedAt: new Date().toISOString()
-      };
-      await saveUserAccountDoc(updatedUser);
-      await logActivity(currentUsername, 'security_2fa_enabled', `User "${currentUsername}" activated Two-Factor Authentication (TOTP RFC 6238).`);
-      setSuccessMsg('Two-Factor Authentication (2FA) successfully activated for your account!');
-      setTimeout(() => setSuccessMsg(null), 4000);
-      if (onUserUpdated) onUserUpdated();
-    }
+  const handleSaveUser2FA = async (newSecret: string, newBackupCodes: string[], enrollCode: string) => {
+    await changeTwoFactor('enable', { secret: newSecret, backupCodes: newBackupCodes, enrollCode });
+    await logActivity(currentUsername, 'security_2fa_enabled', `User "${currentUsername}" activated Two-Factor Authentication (TOTP RFC 6238).`);
+    setSuccessMsg('Two-Factor Authentication (2FA) successfully activated for your account!');
+    setTimeout(() => setSuccessMsg(null), 4000);
+    if (onUserUpdated) onUserUpdated();
   };
 
   const handleDisableUser2FA = async () => {
-    const targetAcc = userAccount || userAccounts.find(u => u.username?.toLowerCase().trim() === currentUsername.toLowerCase().trim());
-    if (targetAcc) {
-      const updatedUser: UserAccount = {
-        ...targetAcc,
-        twoFactorEnabled: false,
-        twoFactorSecret: '',
-        twoFactorBackupCodes: [],
-        twoFactorCreatedAt: ''
-      };
-      await saveUserAccountDoc(updatedUser);
-      await logActivity(currentUsername, 'security_2fa_disabled', `User "${currentUsername}" disabled Two-Factor Authentication.`);
-      setSuccessMsg('Two-Factor Authentication has been disabled.');
-      setTimeout(() => setSuccessMsg(null), 4000);
-      if (onUserUpdated) onUserUpdated();
-    }
+    await changeTwoFactor('disable');
+    await logActivity(currentUsername, 'security_2fa_disabled', `User "${currentUsername}" disabled Two-Factor Authentication.`);
+    setSuccessMsg('Two-Factor Authentication has been disabled.');
+    setTimeout(() => setSuccessMsg(null), 4000);
+    if (onUserUpdated) onUserUpdated();
   };
 
   // Detect current partner on open
@@ -222,27 +203,28 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
     setErrorMsg(null);
 
     try {
-      const existingPassword = userAccount?.password || '';
-      let finalPassword = existingPassword;
+      const finalPassword = userAccount?.password || '';
 
-      // Check if password change is attempted
+      // Password changes are verified and stored by the server; the browser never sees or compares hashes.
       if (oldPassword || newPassword || confirmPassword) {
-        if (existingPassword) {
-          const isOldValid = await verifyPassword(oldPassword.trim(), existingPassword);
-          if (!isOldValid) {
-            throw new Error("The old password you entered is incorrect.");
-          }
-        }
         if (!newPassword.trim()) {
           throw new Error("Please enter a new password.");
         }
         if (newPassword !== confirmPassword) {
           throw new Error("The new password and confirmation password do not match.");
         }
-        if (newPassword.trim().length < 3) {
-          throw new Error("New password must be at least 3 characters long.");
+        if (newPassword.trim().length < 8) {
+          throw new Error("New password must be at least 8 characters long.");
         }
-        finalPassword = await hashPassword(newPassword.trim());
+        const pwRes = await fetch('/api/auth/change-password', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ oldPassword: oldPassword.trim(), newPassword: newPassword.trim() }),
+        });
+        const pwJson = await pwRes.json().catch(() => ({}));
+        if (!pwRes.ok || !pwJson.success) {
+          throw new Error(pwJson.error || 'Could not change the password.');
+        }
       }
 
       const cleanTg = telegramUsername.trim()
