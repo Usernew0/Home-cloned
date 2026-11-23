@@ -1,35 +1,38 @@
-# Staged rollout plan (nothing here has been executed)
+# Release gate: NOT production-ready from repository tests alone
 
-Principle: ship every step in an order where the old client and the new client both keep working, and only then tighten. Rules before a compatible signed-in client would break live Firestore features (chat, memories, letters, dates, music, presence).
+No production deployment, database migration, policy publication or backup has been performed by this change. A GitHub push is not a database backup or a live acceptance test. Do not run bulk sync, migration, cleanup or the all-in-one SQL setup as part of release preparation.
 
-## Stage 0: read-only grounding and backups (no data change)
-1. Save the currently deployed Firestore rules (console copy) and the Supabase policies: this is the rollback source.
-2. Export Firestore and take a Supabase backup before any write step.
-3. Counts (counts only, no document bodies):
-   - Firestore: per collection, docs with no `coupleId`, and docs where `coupleId == 'couple_default'`.
-   - Supabase: `select lower(username), count(*) from user_accounts group by 1 having count(*) > 1;` (case collisions), accounts with NULL or 'couple_default' couple_id (`supabase_hardening.sql` has read-only count queries), and rows with a plaintext password.
-4. Confirm the Vercel project's current env var NAMES and the Git branch that auto-deploys.
+## 0. Inventory and recoverable backup, before any changed client
+- Record deployed code version, Firestore rules/indexes, database schema, functions, table/column grants and policies. Save a supported rollback route.
+- Export Firestore and back up Supabase, including Auth and media ownership metadata where supported. Verify a restore on an isolated copy. Do not regard local browser storage or bidirectional sync as a backup.
+- Use owner-approved read-only counts, not production document bodies: per-collection/table totals; missing camelCase coupleId; snake_case-only couple_id; default-tenant accounts; username case collisions; canonical chat sender/receiver/group membership case.
+- Verify every account/admin setting needed for login exists in Supabase. Firestore/local-only credentials are no longer read, mirrored, or bulk-synced. If there are discrepancies, stop and agree a separate reviewed migration. Do not silently discard or copy credentials through the browser.
+- Compare media accessibility and historic upload ownership on the staging copy.
 
-## Stage 1: configuration (additive, no behavior change until code ships)
-- Vercel env: `SERVER_SESSION_SECRET` (32+ random chars), Supabase URL and service-role key under the names `server/supabase*.ts` reads, `FIREBASE_SERVICE_ACCOUNT_EMAIL`, `FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY`, optionally `FIREBASE_ALLOW_DEFAULT_TENANT=true` only if Stage 0 shows users legitimately in the shared tenant. Values go through the host secret store; never in chat.
-- Firebase console: enable Authentication (required for custom-token sign-in). Create a service account with token-minting rights only.
-- `ENABLE_PASSWORD_REHASH` stays unset (off) for the first release.
+## 1. Approved tenant mapping BEFORE scoped reads
+- Queries filter by camelCase coupleId before normalization. A snake_case-only or missing field record will disappear from a non-admin's query without being deleted remotely.
+- On the isolated copy, prepare a reviewed mapping and dry-run counts. Add only missing fields; never overwrite existing tenant fields or assign every orphan to couple_default. Stop on conflicts and identity ambiguity.
+- Any production mapping is a separate owner-approved data write after backup, before the scoped client is made available. No mapping script is run by this repository.
 
-## Stage 2: indexes (additive)
-Deploy `firestore.indexes.json` and wait until all indexes show as built. Old clients ignore them.
+## 2. Configuration and indexes on isolated staging
+- SERVER_SESSION_SECRET: at least 32 random characters. Supabase URL, anon key and service-role key under the server's documented environment names.
+- Firebase Auth enabled, FIREBASE_SERVICE_ACCOUNT_EMAIL and FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY for the correct Firebase project/database. Default-tenant non-admin token minting requires an explicit reviewed FIREBASE_ALLOW_DEFAULT_TENANT choice, not a blanket workaround.
+- Leave ENABLE_PASSWORD_REHASH unset for the initial release.
+- Deploy and wait for composite indexes to build. Verify host function limits and routes. Nothing here authorizes changes to an owner's hosting account.
 
-## Stage 3: code (compatible with the OLD open rules)
-Ship the patch. The new client signs in to Firebase and runs scoped queries; the still-open rules accept both. Login now requires `SERVER_SESSION_SECRET`, so Stage 1 must be done first. Prefer a Vercel preview deployment, then production. Verify: `/api/health`, login (user, partner, admin, a 2FA account), `/api/proxy` no longer 404, own-profile edit, password change, 2FA enable/disable with reauth, chat in couple/DM/global/group, presence between partners.
-Rollback: redeploy the previous Vercel deployment (instant).
+## 3. Staging acceptance with synthetic fixtures and a restored copy
+- npm ci, npm test, npm run lint, npm run build must pass on a clean checkout. The nine optional Firestore emulator tests are separate and their environment must be provisioned explicitly; do not count them as npm test coverage.
+- Login/logout/reload: partner, admin, guest and 2FA, missing config, invalid Firebase token, failed Supabase Auth session. Check server failure cannot masquerade as a successful data save.
+- Per-role before/after counts and visibility: milestones, memories, letters, dates, questions, activity, chat couple/DM/global/group, presence and music. Verify legacy data stays visible to its intended owner and no other tenant.
+- Add/edit/reload user and admin account, blank password preserves stored hash, password change, 2FA enable/disable and failed-save handling. Confirm no password/hash/2FA secret is cached or written to Firestore. Legacy browser caches are scrubbed on access; this does not erase historic remote copies.
+- Credential/account and settings bulk sync is deliberately disabled. Ordinary settings edits use the server endpoint. Validate these behavior changes with the owner.
+- Test media read/upload/delete on old and new fixtures. Verify deletion failure never gets mistaken for success. Existing unrelated media/sync hazards are not certified fixed by this release.
 
-## Stage 4: data fix, only if Stage 0 found docs without `coupleId` (needs owner approval of the mapping)
-Add-only script, run by an authorized person: set `coupleId` on docs lacking it, from a reviewed mapping (e.g. from `sender`/`createdBy` to the user's couple). Dry-run first and review the counts. It never deletes or overwrites existing fields. Rollback: restore from the Stage 0 export.
+## 4. Coordinated production cutover, only after acceptance
+- Agree a low-use/maintenance window, prevent old tabs from continuing insecure credential edits, and retain rollback snapshots. Do NOT use a phase where raw credentials are mirrored to open Firestore rules.
+- Publish only the reviewed code/config/rules combination proven on staging. Old clients are not guaranteed compatible with closed rules. Plan reload/sign-in behavior explicitly.
+- Check health, authentication, data counts/visibility and representative save/reload/media flows immediately. Stop on mismatch; roll back code/rules/config and investigate. A code rollback does not restore overwritten database rows or grants.
+- Apply supabase_hardening.sql only after a separate review against the actual schema, saved grants/policies and tested rollback. It changes access, and adding a missing defaulted tenant column can label existing rows. Run controlled transaction-sized steps, not the old all-in-one setup script.
 
-## Stage 5: rules (the tightening step)
-Preconditions: Stage 3 verified in production and the Firebase sign-in works for each role. Deploy `firestore.rules` in a low-use window. Browser tabs still running the old client lose Firestore until they reload (the app falls back to Supabase and local storage). Rollback: redeploy the saved Stage 0 rules.
-
-## Stage 6: Supabase hardening (after Stage 3 is confirmed)
-Review then apply `supabase_hardening.sql` in a transaction-sized chunks. Confirm that no client path still writes `user_accounts` or `profiles` directly with the anon key. Rollback SQL is the saved policy list from Stage 0.
-
-## Known not verified
-Real Firebase project behavior (Auth, custom tokens, deployed rules), real data shape, the Vercel Hobby 12-function cap in production, Telegram `setWebhook` re-registration with the same secret token.
+## Remaining limits
+No production end-to-end result, live inventory/count comparison, data mapping, backup restore, Firebase/Auth/rules deployment or hosting configuration has been verified here. Existing manual migration may purge Firestore logs after copying and existing sync uses overwriting writes; these are not repaired or endorsed by this bounded credential correction.

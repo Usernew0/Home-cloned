@@ -331,3 +331,33 @@ test("admin payloads never contain password hashes or 2FA secrets; admin writes 
   const zed = calls.filter((c) => c.table === "user_accounts" && c.body?.username === "zed").pop();
   assert.ok(zed && String(zed.body.password).startsWith("scrypt_v1:") || zed?.body?.[0]?.password?.startsWith("scrypt_v1:"));
 });
+
+test('regression: generic settings writes cannot overwrite redacted credential arrays',async()=>{
+ reset();
+ const result=mockRes();
+ await proxy(req({table:'admin_settings',action:'upsert',data:{id:'adminAccounts',admin_accounts:[{id:'a1',username:'boss',hasPassword:true}]},options:{onConflict:'id'}},{'x-server-session':tokenFor('admin','boss')}),result);
+ assert.equal(result.statusCode,403);
+ assert.equal(calls.filter(c=>c.table==='admin_settings'&&c.method==='POST').length,0);
+ assert.ok(tables.admin_settings[0].admin_accounts[0].password);
+});
+
+test('regression: authoritative admin list prevents old legacy-password fallback',async()=>{
+ reset();
+ tables.admin_settings.push({id:'credentials',username:'boss',password:legacyHash('old-admin-password')});
+ const result=mockRes();await verifyLogin(req({username:'boss',password:'old-admin-password'}),result);
+ assert.equal(result.body.success,false);
+ const correct=mockRes();await verifyLogin(req({username:'boss',password:'boss-pass-1'}),correct);
+ assert.equal(correct.body.success,true);
+});
+
+test('regression: dedicated admin edit preserves omitted password and stored two-factor material',async()=>{
+ reset();
+ tables.admin_settings[0].admin_accounts[0].twoFactorSecret='synthetic-secret';
+ tables.admin_settings[0].admin_accounts[0].twoFactorEnabled=true;
+ const result=mockRes();
+ await adminSettingsPost(req({id:'adminAccounts',admin_accounts:[{id:'a1',username:'boss',password:'',hasPassword:true,twoFactorSecret:'attacker-replacement'}]},{'x-server-session':tokenFor('admin','boss')}),result);
+ assert.equal(result.body.success,true);
+ const sent=calls.filter(c=>c.table==='admin_settings'&&c.method==='POST').at(-1)!;
+ assert.equal(sent.body.admin_accounts[0].password,tables.admin_settings[0].admin_accounts[0].password);
+ assert.equal(sent.body.admin_accounts[0].twoFactorSecret,'synthetic-secret');
+});

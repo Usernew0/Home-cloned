@@ -75,6 +75,8 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
 
   const isAdmin = session.role === "admin";
   const write = action !== "select";
+  // All settings writes use the dedicated merge/hash endpoint, never generic sync/upsert.
+  if (write && table === "admin_settings") return deny(403, "Use the admin settings endpoint; generic settings writes are disabled");
 
   if (write && session.role === "guest") return deny(403, "Read-only account");
   const selfProfileTable = table === "user_accounts" || table === "profiles";

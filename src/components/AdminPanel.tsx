@@ -3030,16 +3030,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
         adminAccounts: updatedList,
       });
 
-      // 2. Save legacy credentials document for backwards compatibility
-      if (updatedList.length > 0) {
-        await saveAdminSettingDoc({
-          id: "credentials",
-          username: updatedList[0].username,
-          password: updatedList[0].password,
-        });
-      }
-
-      setAdminAccountsList(updatedList);
+      // Do not duplicate primary-admin credentials into a second legacy row.
+      // The submitted list may contain plaintext. Use only the redacted server refresh.
+      const safeSettings = storage.getAdminSettings();
+      setAdminAccountsList(safeSettings.find(s => s.id === "adminAccounts")?.adminAccounts || []);
+      setNewAdminPass("");
+      setEditAdminPass("");
       const currentAdmin = localStorage.getItem("love_app_username") || "Admin";
       await logActivity(currentAdmin, "admin_credentials_updated", logMsg || "Updated admin credentials in Firestore & Supabase.");
       setAdminSuccessMsg("Admin portal credentials synchronized to database successfully!");
@@ -3639,11 +3635,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
                   <div className="space-y-1.5">
                     <label className="text-[10px] text-neutral-400 uppercase tracking-wider font-mono">New Password</label>
                     <div className="relative">
-                      <input type={showEditUserPassword ? "text" : "password"} value={editingPassword} onChange={(e) => setEditingPassword(e.target.value)} placeholder="New secret password" className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 pr-9 text-sm text-white focus:outline-none focus:border-indigo-500/60" required />
+                      <input type={showEditUserPassword ? "text" : "password"} value={editingPassword} onChange={(e) => setEditingPassword(e.target.value)} placeholder="Optional new password" className="w-full bg-neutral-950/80 border border-white/10 rounded-xl px-3 py-2 pr-9 text-sm text-white focus:outline-none focus:border-indigo-500/60" />
                       <button type="button" onClick={() => setShowEditUserPassword(!showEditUserPassword)} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-white transition-colors p-0.5" title={showEditUserPassword ? "Hide password" : "Show password"}>
                         {showEditUserPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                       </button>
                     </div>
+                    <p className="text-[11px] text-neutral-400 mt-1">Leave blank to keep the current password.</p>
                   </div>
 
                   <div className="space-y-1.5">
@@ -3881,7 +3878,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
                           <button
                             onClick={() => {
                               setEditingUser(user);
-                              setEditingPassword(user.password || "");
+                              setEditingPassword("");
                               setEditingUserCoupleId(user.coupleId || "");
                               setEditingUserGender(user.gender || "male");
                               const userTenant = allLinkedCoupleTenants.find((t) => t.coupleId === user.coupleId);

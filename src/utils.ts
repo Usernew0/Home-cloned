@@ -1,3 +1,4 @@
+import { redactCredentialRecord, safeCachedSettings } from "./lib/credentialSafety";
 import { Milestone, DatePlan, Memory, LoveLetter, DateIdea, ChatMessage, CoupleQuestion, UserAccount, AdminSetting, UserActivityLog, CoupleTenant, CelebrationCard, CelebrationCardType, GalleryAlbum, MusicTrack } from './types';
 
 // Pre-seeded milestones
@@ -242,13 +243,15 @@ export const storage = {
       const data = localStorage.getItem('love_user_accounts');
       if (!data) return [];
       const parsed = JSON.parse(data);
-      return Array.isArray(parsed) ? parsed : [];
+      const safe = Array.isArray(parsed) ? parsed.map(redactCredentialRecord) : [];
+      localStorage.setItem('love_user_accounts', JSON.stringify(safe));
+      return safe;
     } catch {
       return [];
     }
   },
   setUserAccounts: (data: UserAccount[]) => {
-    localStorage.setItem('love_user_accounts', JSON.stringify(Array.isArray(data) ? data : []));
+    localStorage.setItem('love_user_accounts', JSON.stringify(Array.isArray(data) ? data.map(redactCredentialRecord) : []));
   },
 
   getAdminSettings: (): AdminSetting[] => {
@@ -256,13 +259,15 @@ export const storage = {
       const data = localStorage.getItem('love_admin_settings');
       if (!data) return [];
       const parsed = JSON.parse(data);
-      return Array.isArray(parsed) ? parsed : [];
+      const safe = safeCachedSettings(Array.isArray(parsed) ? parsed : []);
+      localStorage.setItem('love_admin_settings', JSON.stringify(safe));
+      return safe;
     } catch {
       return [];
     }
   },
   setAdminSettings: (data: AdminSetting[]) => {
-    localStorage.setItem('love_admin_settings', JSON.stringify(Array.isArray(data) ? data : []));
+    localStorage.setItem('love_admin_settings', JSON.stringify(safeCachedSettings(Array.isArray(data) ? data : [])));
   },
 
   getActivityLogs: (): UserActivityLog[] => {

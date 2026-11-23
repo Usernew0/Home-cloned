@@ -351,6 +351,10 @@ export async function syncSingleTableFirestoreToSupabase(tableKey: SyncTableKey)
     errors: []
   };
 
+  if (tableKey === 'user_accounts' || tableKey === 'admin_settings') {
+    result.errors.push('Account/settings records are server-only; account bulk sync is disabled.');
+    return result;
+  }
   if (!isSupabaseConfigured) {
     result.errors.push('Supabase is not configured or offline.');
     return result;
@@ -439,22 +443,6 @@ export async function syncSingleTableFirestoreToSupabase(tableKey: SyncTableKey)
         }
         break;
       }
-      case 'user_accounts': {
-        const local = storage.getUserAccounts();
-        const fs = await getFirestoreUserAccounts();
-        const map = new Map<string, UserAccount>();
-        local.forEach(item => map.set(item.id, item));
-        fs.forEach(item => map.set(item.id, item));
-        const combined = Array.from(map.values());
-        result.processedCount = combined.length;
-        for (const u of combined) {
-          const dbPayload = mapToDb({ ...u, coupleId: u.coupleId || 'couple_default' });
-          const res = await safeUpsert('user_accounts', dbPayload, 'id');
-          if (res.success) result.syncedCount++;
-          else result.errors.push(`user_account (${u.id}): ${res.error}`);
-        }
-        break;
-      }
       case 'couple_tenants': {
         const local = storage.getCoupleTenants();
         const fs = await getFirestoreCoupleTenants();
@@ -493,49 +481,6 @@ export async function syncSingleTableFirestoreToSupabase(tableKey: SyncTableKey)
               result.errors.push(`celebration_card (${card.id}): ${res.error}`);
             }
           }
-        }
-        break;
-      }
-      case 'admin_settings': {
-        const local = storage.getAdminSettings();
-        const fs = await getFirestoreAdminSettings();
-        const map = new Map<string, AdminSetting>();
-        local.forEach(item => map.set(item.id, item));
-        fs.forEach(item => map.set(item.id, item));
-        const combined = Array.from(map.values());
-        result.processedCount = combined.length;
-        for (const s of combined) {
-          let dbPayload = mapToDb(s);
-          let res = await safeUpsert('admin_settings', dbPayload, 'id');
-          if (!res.success) {
-            if (s.id === 'promoCodes' || res.error?.includes('promo_codes')) {
-              const fallbackPayload: any = {
-                id: s.id,
-                password: s.promoCodes ? JSON.stringify(s.promoCodes) : (s.password || null),
-                username: s.username || null,
-                visible_tabs: s.visibleTabs || (s.promoCodes ? { promoCodes: s.promoCodes } : null)
-              };
-              res = await safeUpsert('admin_settings', fallbackPayload, 'id');
-            } else if (s.id === 'subscriptionPlans' || res.error?.includes('subscription_plans')) {
-              const fallbackPayload: any = {
-                id: s.id,
-                password: s.subscriptionPlans ? JSON.stringify(s.subscriptionPlans) : (s.password || null),
-                username: s.username || null,
-                visible_tabs: s.visibleTabs || (s.subscriptionPlans ? { subscriptionPlans: s.subscriptionPlans } : null)
-              };
-              res = await safeUpsert('admin_settings', fallbackPayload, 'id');
-            } else if (res.error?.includes('admin_accounts') || s.id === 'adminAccounts') {
-              const fallbackPayload: any = {
-                id: s.id,
-                password: s.adminAccounts ? JSON.stringify(s.adminAccounts) : (s.password || null),
-                username: s.username || null,
-                visible_tabs: s.visibleTabs || (s.adminAccounts ? { adminAccounts: s.adminAccounts } : null)
-              };
-              res = await safeUpsert('admin_settings', fallbackPayload, 'id');
-            }
-          }
-          if (res.success) result.syncedCount++;
-          else result.errors.push(`admin_setting (${s.id}): ${res.error}`);
         }
         break;
       }
@@ -583,6 +528,10 @@ export async function syncSingleTableSupabaseToFirestore(tableKey: SyncTableKey)
     errors: []
   };
 
+  if (tableKey === 'user_accounts' || tableKey === 'admin_settings') {
+    result.errors.push('Account/settings records are server-only; account bulk sync is disabled.');
+    return result;
+  }
   if (!isSupabaseConfigured) {
     result.errors.push('Supabase is not configured or offline.');
     return result;
@@ -679,20 +628,6 @@ export async function syncSingleTableSupabaseToFirestore(tableKey: SyncTableKey)
         storage.setCoupleQuestions(Array.from(map.values()));
         break;
       }
-      case 'user_accounts': {
-        const items = data.map(row => mapFromDb<UserAccount>(row));
-        const currentLocal = storage.getUserAccounts();
-        const map = new Map<string, UserAccount>();
-        currentLocal.forEach(i => map.set(i.id, i));
-
-        for (const item of items) {
-          await saveFirestoreUserAccountDoc(item);
-          map.set(item.id, item);
-          result.syncedCount++;
-        }
-        storage.setUserAccounts(Array.from(map.values()));
-        break;
-      }
       case 'couple_tenants': {
         const items = data.map(row => mapFromDb<CoupleTenant>(row));
         const currentLocal = storage.getCoupleTenants();
@@ -719,20 +654,6 @@ export async function syncSingleTableSupabaseToFirestore(tableKey: SyncTableKey)
           result.syncedCount++;
         }
         storage.saveCelebrationCards(Array.from(map.values()));
-        break;
-      }
-      case 'admin_settings': {
-        const items = data.map(row => mapFromDb<AdminSetting>(row));
-        const currentLocal = storage.getAdminSettings();
-        const map = new Map<string, AdminSetting>();
-        currentLocal.forEach(i => map.set(i.id, i));
-
-        for (const item of items) {
-          await saveFirestoreAdminSettingDoc(item);
-          map.set(item.id, item);
-          result.syncedCount++;
-        }
-        storage.setAdminSettings(Array.from(map.values()));
         break;
       }
       case 'chat_messages': {

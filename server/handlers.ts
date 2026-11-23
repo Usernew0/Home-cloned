@@ -119,12 +119,14 @@ export async function adminSettingsPost(req: any, res: any) {
     }
     let toWrite: any = setting;
     if (setting.id === "adminAccounts" || setting.id === "credentials") {
-      const { data: existingRow } = await supabaseAdmin.from("admin_settings").select("*").eq("id", setting.id).maybeSingle();
+      const { data: existingRow, error: readError } = await supabaseAdmin.from("admin_settings").select("*").eq("id", setting.id).maybeSingle();
+      if (readError) return res.status(500).json({success:false, error:"Could not verify existing credentials; nothing was saved"});
       if (setting.id === "adminAccounts") {
         const incoming = readAdminAccounts(setting);
         const merged = mergeAdminAccounts(readAdminAccounts(existingRow), incoming);
         if (merged.error) return res.status(400).json({ success: false, error: merged.error });
-        toWrite = { ...omit(setting, ["admin_accounts", "adminAccounts"]), ...adminAccountsPatch(existingRow || setting, merged.accounts) };
+        const clean = omit(setting, ["password", "admin_accounts", "adminAccounts", "visible_tabs", "visibleTabs", "two_factor_secret", "two_factor_backup_codes"]);
+        toWrite = { ...clean, ...adminAccountsPatch(existingRow || setting, merged.accounts) };
       } else {
         toWrite = omit(setting, ["two_factor_secret", "two_factor_backup_codes", "twoFactorSecret", "twoFactorBackupCodes", "twoFactorEnabled", "two_factor_enabled", "hasPassword"]);
         if (typeof setting.password === "string" && setting.password) toWrite.password = toStoredPassword(setting.password);
@@ -319,7 +321,7 @@ export async function verifyLogin(req: any, res: any) {
     }
 
     const legacyCreds = adminRows.find((s: any) => s.id === "credentials");
-    if (!isAuthorized && legacyCreds?.username?.toLowerCase().trim() === cleanUser && legacyCreds.password && (await verifyPassword(password, legacyCreds.password))) {
+    if (!isAuthorized && adminAccounts.length === 0 && legacyCreds?.username?.toLowerCase().trim() === cleanUser && legacyCreds.password && (await verifyPassword(password, legacyCreds.password))) {
       isAuthorized = true;
       authenticatedUsername = legacyCreds.username;
       authenticatedAccountId = String(legacyCreds.id || "");

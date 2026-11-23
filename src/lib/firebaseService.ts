@@ -325,17 +325,7 @@ export async function deleteFirestoreActivityLogDoc(id: string): Promise<boolean
 }
 
 export async function getFirestoreAdminSettings(): Promise<AdminSetting[]> {
-  try {
-    const snapshot = await getDocs(collection(db, 'adminSettings'));
-    const list: AdminSetting[] = [];
-    snapshot.forEach((d) => {
-      list.push(d.data() as AdminSetting);
-    });
-    return list;
-  } catch (err) {
-    console.warn("Failed to fetch Firestore adminSettings:", err);
-    return [];
-  }
+  throw new Error('Settings are server-only; legacy Firestore settings reads are disabled.');
 }
 
 export async function deleteFirestoreAdminSettingDoc(id: string): Promise<boolean> {
@@ -387,33 +377,16 @@ export async function verifyFirestoreConnection(): Promise<{
 // REAL-TIME FIRESTORE USER ACCOUNTS
 // ==========================================
 
-export function subscribeToFirestoreUserAccounts(callback: (data: UserAccount[]) => void) {
-  return onSnapshot(collection(db, 'userAccounts'), (snapshot) => {
-    const list: UserAccount[] = [];
-    snapshot.forEach((doc) => {
-      list.push(normalizeCoupleId(doc.data() as UserAccount));
-    });
-    callback(list);
-  }, (error) => {
-    console.warn("Firestore userAccounts subscription info:", error.message);
-  });
+export function subscribeToFirestoreUserAccounts(_callback: (data: UserAccount[]) => void) {
+  return () => {}; // No legacy credential reads, including under old open rules.
 }
 
-export async function saveFirestoreUserAccountDoc(user: UserAccount) {
-  try {
-    const payload = normalizeCoupleId(user);
-    await setDoc(doc(db, 'userAccounts', user.id), cleanUndefined(payload));
-  } catch (err) {
-    console.warn("Firestore saveUserAccountDoc error:", err);
-  }
+export async function saveFirestoreUserAccountDoc(_user: UserAccount) {
+  throw new Error('Account records are server-only and cannot be mirrored to Firestore.');
 }
 
-export async function deleteFirestoreUserAccountDoc(id: string) {
-  try {
-    await deleteDoc(doc(db, 'userAccounts', id));
-  } catch (err) {
-    console.warn("Firestore deleteUserAccountDoc error:", err);
-  }
+export async function deleteFirestoreUserAccountDoc(_id: string) {
+  throw new Error('Account records are server-only. Use the authenticated account API.');
 }
 
 // ==========================================
@@ -453,24 +426,12 @@ export async function deleteFirestoreCoupleTenantDoc(coupleId: string) {
 // REAL-TIME FIRESTORE ADMIN SETTINGS
 // ==========================================
 
-export function subscribeToFirestoreAdminSettings(callback: (data: AdminSetting[]) => void) {
-  return onSnapshot(collection(db, 'adminSettings'), (snapshot) => {
-    const list: AdminSetting[] = [];
-    snapshot.forEach((doc) => {
-      list.push(doc.data() as AdminSetting);
-    });
-    callback(list);
-  }, (error) => {
-    console.warn("Firestore adminSettings subscription info:", error.message);
-  });
+export function subscribeToFirestoreAdminSettings(_callback: (data: AdminSetting[]) => void) {
+  return () => {}; // Do not download legacy credential documents, even with open rules.
 }
 
-export async function saveFirestoreAdminSettingDoc(setting: AdminSetting) {
-  try {
-    await setDoc(doc(db, 'adminSettings', setting.id), cleanUndefined(setting));
-  } catch (err) {
-    console.warn("Firestore saveAdminSettingDoc error:", err);
-  }
+export async function saveFirestoreAdminSettingDoc(_setting: AdminSetting) {
+  throw new Error('Settings are server-only; Firestore settings mirroring is disabled.');
 }
 
 // ==========================================
@@ -699,15 +660,7 @@ export async function getFirestoreCoupleQuestions(): Promise<CoupleQuestion[]> {
 }
 
 export async function getFirestoreUserAccounts(): Promise<UserAccount[]> {
-  try {
-    const snapshot = await getDocs(collection(db, 'userAccounts'));
-    const list: UserAccount[] = [];
-    snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as UserAccount)));
-    return list;
-  } catch (err) {
-    console.warn("Failed to fetch Firestore userAccounts:", err);
-    return [];
-  }
+  throw new Error('Account records are server-only; legacy Firestore sync is disabled.');
 }
 
 export async function getFirestoreCoupleTenants(): Promise<CoupleTenant[]> {

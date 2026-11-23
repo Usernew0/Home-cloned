@@ -1,3 +1,4 @@
+import { isCredentialSetting, redactCredentialRecord, saveCredentialSetting } from "./credentialSafety";
 import { supabase, isSupabaseConfigured } from "./supabase";
 import { uploadBase64Media, deleteMediaFile } from "./storageService";
 import { Milestone, DatePlan, Memory, LoveLetter, CoupleQuestion, UserAccount, AdminSetting, AdminAccount, UserActivityLog, CoupleTenant, CelebrationCard } from "../types";
@@ -915,12 +916,8 @@ export function subscribeToUserAccounts(callback: (data: UserAccount[]) => void)
   callback(initial);
   userAccountListeners.push(callback);
 
-  const unsubFirestore = subscribeToFirestoreUserAccounts((fsAccounts) => {
-    if (fsAccounts && fsAccounts.length >= 0) {
-      storage.setUserAccounts(fsAccounts);
-      notifyUserAccountListeners(fsAccounts);
-    }
-  });
+  const unsubFirestore = () => {}; // Credentials are read only through the authenticated server.
+
 
   if (isSupabaseConfigured && supabase) {
     const fetchAccounts = async () => {
@@ -977,49 +974,26 @@ export async function saveUserAccountDoc(user: UserAccount) {
     updatedList = [...current, userWithCouple];
   }
 
-  // Never keep a plaintext password in the browser. The server hashes it on write.
-  const localSafe = (list: UserAccount[]) => list.map((u) => (u.id === userWithCouple.id ? { ...u, password: current[existingIdx]?.password || "" } : u));
-  const safeList = localSafe(updatedList);
+  if (!isSupabaseConfigured || !supabase) throw new Error("Account changes require the server database.");
+  const res = await safeUpsert("user_accounts", mapToDb(userWithCouple), "id");
+  if (!res.success) throw new Error(res.error || "Account save failed.");
+  const safeList = updatedList.map(redactCredentialRecord);
   storage.setUserAccounts(safeList);
   notifyUserAccountListeners(safeList);
+  const profileResult = await safeUpsert("profiles", {id:userWithCouple.id, username:userWithCouple.username, display_name:userWithCouple.username}, "id");
+  if (!profileResult.success) throw new Error("Account saved, but profile save failed: " + profileResult.error);
 
-  await saveFirestoreUserAccountDoc({ ...userWithCouple, password: "" });
-
-  if (isSupabaseConfigured && supabase) {
-    const dbPayload = mapToDb(userWithCouple);
-    const res = await safeUpsert("user_accounts", dbPayload, "id");
-    if (!res.success) {
-      handleSupabaseError("saveUserAccountDoc", res.error);
-    }
-
-    // Automatically sync profiles table as well so foreign key references work seamlessly
-    const profilePayload = {
-      id: userWithCouple.id,
-      username: userWithCouple.username,
-      display_name: userWithCouple.username,
-    };
-    await safeUpsert("profiles", profilePayload, "id");
-  }
 }
 
 export async function deleteUserAccountDoc(id: string) {
-  const current = storage.getUserAccounts();
-  const updatedList = current.filter((u) => u.id !== id && u.username.toLowerCase() !== id.toLowerCase());
-
-  storage.setUserAccounts(updatedList);
-  notifyUserAccountListeners(updatedList);
-
-  await deleteFirestoreUserAccountDoc(id);
-
-  if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("user_accounts").delete().eq("id", id);
-
-    await supabase.from("profiles").delete().eq("id", id);
-
-    if (error) {
-      handleSupabaseError("deleteUserAccountDoc", error);
-    }
-  }
+  if (!isSupabaseConfigured || !supabase) throw new Error("Account deletion requires the server database.");
+  const result = await proxyCall({table:"user_accounts", action:"delete", filters:[{column:"id",operator:"eq",value:id}]});
+  if (result.error) throw new Error(result.error);
+  const profile = await proxyCall({table:"profiles", action:"delete", filters:[{column:"id",operator:"eq",value:id}]});
+  const updated = storage.getUserAccounts().filter(u => u.id !== id);
+  storage.setUserAccounts(updated);
+  notifyUserAccountListeners(updated);
+  if (profile.error) throw new Error("Account deleted, but profile cleanup failed: " + profile.error);
 }
 
 // ==========================================
@@ -1158,8 +1132,14 @@ export function mergeAdminSettings(sources: (AdminSetting[] | null | undefined)[
 
   for (const list of sources) {
     if (!list) continue;
-    for (const doc of list) {
+    for (const original of list) {
+      const doc = isCredentialSetting(original) ? redactCredentialRecord(original) : original;
       if (!doc || !doc.id) continue;
+      // Server credential lists replace stale cache lists, never union removed admins back in.
+      if (isCredentialSetting(doc)) {
+        map.set(doc.id, JSON.parse(JSON.stringify(doc)));
+        continue;
+      }
       const existing = map.get(doc.id);
       if (!existing) {
         map.set(doc.id, JSON.parse(JSON.stringify(doc)));
@@ -1238,7 +1218,7 @@ export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => voi
 
   const unsubFirestore = subscribeToFirestoreAdminSettings((fsSettings) => {
     if (fsSettings) {
-      cachedFirestoreAdminSettings = fsSettings;
+      cachedFirestoreAdminSettings = fsSettings.filter(row => !isCredentialSetting(row));
       updateAndSync();
     }
   });
@@ -1308,6 +1288,20 @@ export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => voi
 }
 
 export async function saveAdminSettingDoc(setting: AdminSetting) {
+  if (isCredentialSetting(setting)) {
+    if (!isSupabaseConfigured) throw new Error("Credential changes require the server database.");
+    await saveCredentialSetting(mapToDb(setting), {
+      fetch, token: localStorage.getItem("love_server_session_token") || "",
+      commit: (rows) => {
+        const safe = rows.map((row) => mapFromDb<AdminSetting>(row));
+        cachedSupabaseAdminSettings = safe;
+        cachedFirestoreAdminSettings = cachedFirestoreAdminSettings.filter(row => !isCredentialSetting(row));
+        storage.setAdminSettings(safe);
+        notifyAdminSettingListeners(safe);
+      }
+    });
+    return;
+  }
   const current = storage.getAdminSettings();
   const existingIdx = current.findIndex((s) => s.id === setting.id);
   let updatedList: AdminSetting[];
@@ -1319,13 +1313,10 @@ export async function saveAdminSettingDoc(setting: AdminSetting) {
     updatedList = [...current, setting];
   }
 
-  storage.setAdminSettings(updatedList);
-  notifyAdminSettingListeners(updatedList);
 
-  // ALWAYS save to Firestore
-  await saveFirestoreAdminSettingDoc(setting);
+  // Settings have one server authority. Never mirror credential-bearing legacy collections.
 
-  // ALWAYS save via secure backend proxy
+  if (!isSupabaseConfigured) throw new Error("Settings changes require the server database.");
   if (isSupabaseConfigured) {
     try {
       const dbPayload = mapToDb(setting);
@@ -1334,7 +1325,7 @@ export async function saveAdminSettingDoc(setting: AdminSetting) {
         dbPayload.telegram_config.botToken = "";
       }
       const serverSession = localStorage.getItem("love_server_session_token");
-      await fetch("/api/admin-settings", {
+      const response = await fetch("/api/admin-settings", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1342,8 +1333,12 @@ export async function saveAdminSettingDoc(setting: AdminSetting) {
         },
         body: JSON.stringify(dbPayload),
       });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || "Settings save failed.");
+      storage.setAdminSettings(updatedList);
+      notifyAdminSettingListeners(updatedList);
     } catch (err) {
-      handleSupabaseError("saveAdminSettingDoc proxy", err);
+      throw err;
     }
   }
 }
@@ -1574,6 +1569,11 @@ export async function updateDataCoupleId(oldCoupleId: string, newCoupleId: strin
  */
 export async function safeUpsert(table: string, payload: any, onConflict: string = "id"): Promise<{ success: boolean; error?: string }> {
   try {
+    if (table === "admin_settings") {
+      if (isCredentialSetting(payload)) return {success:false, error:"Credential settings are excluded from bulk sync. Edit them in account management."};
+      await saveAdminSettingDoc(mapFromDb<AdminSetting>(payload));
+      return {success:true};
+    }
     let currentPayload = { ...payload };
 
     // Intelligent retry loop: strips missing schema cache columns or foreign key constraints automatically
@@ -1721,14 +1721,8 @@ export async function syncAllDataToSupabase(): Promise<SupabaseSyncSummary> {
       else summary.errors.push(`milestones (${ms.id}): ${res.error}`);
     }
 
-    // 6. User Accounts
-    const users = storage.getUserAccounts();
-    for (const u of users) {
-      const dbPayload = mapToDb({ ...u, coupleId: u.coupleId || "couple_default" });
-      const res = await safeUpsert("user_accounts", dbPayload, "id");
-      if (res.success) summary.userAccountsSynced++;
-      else summary.errors.push(`user_accounts (${u.id}): ${res.error}`);
-    }
+    // Account records are intentionally excluded from stale-cache bulk sync.
+    summary.errors.push("Account records are server-only; use account management instead of bulk sync.");
 
     // 6.5. Couple Tenants
     const tenants = storage.getCoupleTenants();
@@ -1765,6 +1759,10 @@ export async function syncAllDataToSupabase(): Promise<SupabaseSyncSummary> {
     // 7. Admin Settings
     const settings = storage.getAdminSettings();
     for (const s of settings) {
+      if (isCredentialSetting(s)) {
+        summary.errors.push("Credential settings are excluded from bulk sync.");
+        continue;
+      }
       let dbPayload = mapToDb(s);
       let res = await safeUpsert("admin_settings", dbPayload);
       if (!res.success) {
