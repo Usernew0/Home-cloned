@@ -1,0 +1,29 @@
+export type LinkTenant = { coupleId?: string; partner1: string; partner2?: string };
+export type LinkUser = { id?: string; username: string; coupleId?: string };
+const norm = (v?: string) => (v || "").toLowerCase().trim();
+
+/**
+ * Which tenant a user card belongs to. The user's own coupleId wins. Name matching is only a fallback,
+ * and a tenant with both partners beats a stale one-person tenant that happens to list the same name first.
+ */
+export function findTenantForUser<T extends LinkTenant>(user: LinkUser, tenants: T[]): T | undefined {
+  if (user.coupleId) {
+    const byId = tenants.find((t) => t.coupleId === user.coupleId);
+    if (byId) return byId;
+  }
+  const name = norm(user.username);
+  const byName = tenants.filter((t) => norm(t.partner1) === name || (t.partner2 && norm(t.partner2) === name));
+  return byName.find((t) => t.partner1 && t.partner2) || byName[0];
+}
+
+/** The other person in the user's couple, or undefined when genuinely unlinked. */
+export function partnerNameFor(user: LinkUser, users: LinkUser[], tenants: LinkTenant[]): string | undefined {
+  const tenant = findTenantForUser(user, tenants);
+  const name = norm(user.username);
+  if (tenant) {
+    const other = norm(tenant.partner1) === name ? tenant.partner2 : tenant.partner1;
+    if (other && norm(other) !== name) return other;
+  }
+  if (user.coupleId) return users.find((u) => u.id !== user.id && norm(u.username) !== name && u.coupleId === user.coupleId)?.username;
+  return undefined;
+}

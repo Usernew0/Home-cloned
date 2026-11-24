@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { findTenantForUser, partnerNameFor } from "../lib/coupleLink";
 import schemaSql from '../../supabase_schema.sql?raw';
 import { motion, AnimatePresence } from "motion/react";
 import {
@@ -3488,9 +3489,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
                     const isPasswordVisible = showAllUserPasswords || !!visiblePasswordIds[user.id];
 
                     // Find matching tenant for this user
-                    const tenant = allLinkedCoupleTenants.find((t) => (t.coupleId && user.coupleId && t.coupleId === user.coupleId) || t.partner1.toLowerCase() === user.username.toLowerCase() || (t.partner2 && t.partner2.toLowerCase() === user.username.toLowerCase()));
+                    const tenant = findTenantForUser(user, allLinkedCoupleTenants);
 
-                    const partnerName = tenant ? (tenant.partner1.toLowerCase() === user.username.toLowerCase() ? tenant.partner2 : tenant.partner1) : userAccounts.find((u) => u.id !== user.id && u.coupleId && u.coupleId === user.coupleId)?.username;
+                    const partnerName = partnerNameFor(user, userAccounts, allLinkedCoupleTenants);
 
                     return (
                       <div key={`user-row-${user.id || user.username}-${uIdx}`} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-white/5 transition-all">
