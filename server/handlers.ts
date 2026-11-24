@@ -8,9 +8,10 @@ import { sessionMatchesIdentity } from "./participant.js";
 import { authorizeProxy, stripColumns, isGlobalChatRow, visibleChatRow, isDirectChatRow, chatVisibilityOr, type Authorized, type Denied } from "./policy.js";
 import { clearFailures, isBlocked, recordFailure } from "./ratelimit.js";
 import { requireRole, sessionFromRequest } from "./guards.js";
+import { resolveServerSupabaseKey } from "./serverKey.js";
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "";
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || "";
+const supabaseKey = resolveServerSupabaseKey();
 export const supabaseAdmin = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 

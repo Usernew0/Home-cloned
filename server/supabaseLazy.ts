@@ -1,4 +1,5 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { resolveServerSupabaseKey } from "./serverKey.js";
 
 let client: SupabaseClient | null = null;
 
@@ -6,7 +7,7 @@ let client: SupabaseClient | null = null;
 export function getServiceSupabase(): SupabaseClient {
   if (!client) {
     const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+    const key = resolveServerSupabaseKey();
     if (!url || !key) throw new Error("Supabase is not configured");
     client = createClient(url, key);
   }

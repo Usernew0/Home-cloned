@@ -24,7 +24,7 @@ function runtimeProbe(overrides: Record<string, string>, missing = false) {
       const expected = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
       assert.equal(supabaseAdmin.supabaseUrl, expected);
       assert.equal(getServiceSupabase().supabaseUrl, expected);
-      assert.equal(getServiceSupabase().supabaseKey, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY);
+      assert.equal(getServiceSupabase().supabaseKey, process.env.SUPABASE_SERVICE_ROLE_KEY);
     }
   `;
   const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], { cwd: process.cwd(), env, encoding: 'utf8' });
@@ -33,7 +33,17 @@ function runtimeProbe(overrides: Record<string, string>, missing = false) {
 
 test('server clients work with SUPABASE_URL alone', () => runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'synthetic-service-key' }));
 test('server clients prefer SUPABASE_URL over legacy URL', () => runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', VITE_SUPABASE_URL: 'https://legacy.supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'synthetic-service-key' }));
-test('server clients retain legacy public URL and anon fallback', () => runtimeProbe({ VITE_SUPABASE_URL: 'https://legacy.supabase.test', VITE_SUPABASE_ANON_KEY: 'synthetic-anon-key' }));
+test('server clients keep the legacy public URL alias with a service key', () => runtimeProbe({ VITE_SUPABASE_URL: 'https://legacy.supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'synthetic-service-key' }));
+test('no anon-key fallback: the public key alone leaves the server unconfigured (503)', () => runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', VITE_SUPABASE_ANON_KEY: 'synthetic-anon-key' }, true));
+const jwt = (role: string) => `h.${Buffer.from(JSON.stringify({ role })).toString('base64url')}.s`;
+test('an anon JWT or sb_publishable key placed in the service-role variable is refused', () => {
+  runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', SUPABASE_SERVICE_ROLE_KEY: jwt('anon') }, true);
+  runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'sb_publishable_synthetic' }, true);
+});
+test('a service_role JWT and an sb_secret key are accepted', () => {
+  runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', SUPABASE_SERVICE_ROLE_KEY: jwt('service_role') });
+  runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'sb_secret_synthetic' });
+});
 test('missing URL fails closed without network calls', () => runtimeProbe({ SUPABASE_SERVICE_ROLE_KEY: 'synthetic-service-key' }, true));
 test('missing server key refuses unsafe VITE service-role alias', () => runtimeProbe({ SUPABASE_URL: 'https://primary.supabase.test', VITE_SUPABASE_SERVICE_ROLE_KEY: 'unsafe-legacy-test-key' }, true));
 test('public build config exposes only allowlisted values and maps public URL', () => {
