@@ -32,3 +32,16 @@ export function partnerNameFor(user: LinkUser, users: LinkUser[], tenants: LinkT
   if (user.coupleId) return users.find((u) => u.id !== user.id && norm(u.username) !== name && u.coupleId === user.coupleId)?.username;
   return undefined;
 }
+
+/** True when at least one account currently points at this space. Not-in-use spaces are kept, only labelled differently. */
+export function isTenantInUse(tenant: LinkTenant, users: LinkUser[]): boolean {
+  return !!tenant.coupleId && users.some((u) => u.coupleId === tenant.coupleId);
+}
+
+/**
+ * Factual label only: no loaded account currently has this coupleId. Never claims the space is unused or empty of data.
+ * Returns false while accounts are still loading (cache only) or the list is empty.
+ */
+export function isSpaceUnlinked(tenant: LinkTenant, users: LinkUser[], accountsLoaded: boolean): boolean {
+  return accountsLoaded && users.length > 0 && !isTenantInUse(tenant, users);
+}

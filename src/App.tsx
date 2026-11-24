@@ -256,6 +256,8 @@ export default function App() {
   const [coupleQuestions, setCoupleQuestions] = useState<CoupleQuestion[]>(() => storage.getCoupleQuestions());
   const [userPresences, setUserPresences] = useState<UserPresence[]>([]);
   const [userAccounts, setUserAccounts] = useState<UserAccount[]>(() => storage.getUserAccounts());
+  // False until the server list has replaced the local cache, so the panel never reports "no accounts linked" from a stale cache.
+  const [userAccountsFetched, setUserAccountsFetched] = useState(false);
   const [adminSettings, setAdminSettings] = useState<AdminSetting[]>(() => storage.getAdminSettings());
   const [activityLogs, setActivityLogs] = useState<UserActivityLog[]>([]);
 
@@ -1063,8 +1065,10 @@ export default function App() {
     }
 
     const timer = setTimeout(() => {
+      let accountCallbacks = 0;
       unsubUserAccounts = subscribeToUserAccounts((data) => {
         setUserAccounts(data);
+        if (++accountCallbacks > 1) setUserAccountsFetched(true);
       });
 
       unsubAdminSettings = subscribeToAdminSettings((data) => {
@@ -1810,7 +1814,7 @@ export default function App() {
             </div>
           }
         >
-          <AdminPanel userAccounts={userAccounts} adminSettings={adminSettings} onLogout={handleLogout} />
+          <AdminPanel userAccounts={userAccounts} accountsLoaded={userAccountsFetched} adminSettings={adminSettings} onLogout={handleLogout} />
         </Suspense>
       </ErrorBoundary>
     );

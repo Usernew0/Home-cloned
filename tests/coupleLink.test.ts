@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {findTenantForUser, partnerNameFor} from '../src/lib/coupleLink.ts';
+import {findTenantForUser, partnerNameFor, isTenantInUse, isSpaceUnlinked} from '../src/lib/coupleLink.ts';
 
 const tenants=[
  {coupleId:'c_solo_e',partner1:'Ebrahimtest',partner2:''},
@@ -29,4 +29,17 @@ test('name fallback never crosses into a tenant with a different explicit couple
  assert.equal(findTenantForUser(u,tenants),undefined);
  assert.equal(partnerNameFor(u,[u],tenants),undefined);
  assert.equal(findTenantForUser({id:'9',username:'Ebrahimtest'},tenants)!.coupleId,'c_joint');
+});
+
+test('old solo tenants are flagged unused while the joint one is in use',()=>{
+ assert.equal(isTenantInUse(tenants[0],users),false);
+ assert.equal(isTenantInUse(tenants[1],users),false);
+ assert.equal(isTenantInUse(tenants[2],users),true);
+});
+
+test('unlinked label needs a server-loaded, non-empty account list',()=>{
+ assert.equal(isSpaceUnlinked(tenants[0],users,true),true);
+ assert.equal(isSpaceUnlinked(tenants[2],users,true),false);
+ assert.equal(isSpaceUnlinked(tenants[0],users,false),false);   // still loading / cache only
+ assert.equal(isSpaceUnlinked(tenants[0],[],true),false);       // empty or failed load
 });

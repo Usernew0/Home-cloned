@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test tests/auth.test.ts tests/audio.test.ts tests/security.test.ts tests/handlers.test.ts tests/firebaseToken.test.ts tests/credentialSafety.test.ts tests/environment.test.ts tests/backfill.test.ts tests/coupleLink.test.ts"
+    "test": "node --import tsx --test tests/auth.test.ts tests/audio.test.ts tests/security.test.ts tests/handlers.test.ts tests/firebaseToken.test.ts tests/credentialSafety.test.ts tests/environment.test.ts tests/backfill.test.ts tests/coupleLink.test.ts tests/coupleTenantRow.test.tsx"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
