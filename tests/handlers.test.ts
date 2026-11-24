@@ -396,3 +396,59 @@ test("global lounge switch: proxy hides and refuses global chat for a closed acc
   await refreshFirebaseToken(req({}, { "x-server-session": tok(`u:user_alice.${"cc".repeat(16)}`, "alice") }), r3);
   assert.equal(r3.statusCode, 409);
 });
+
+test("proxyEntry: ?op= dispatch keeps auth, body and error semantics of each operation", async () => {
+  reset();
+  const { proxyEntry } = await import("../server/handlers.ts");
+  tables.user_accounts = [
+    { id: "user_alice", username: "alice", role: "user", couple_id: "c1", pid_nonce: "aa".repeat(16), enable_global_chat: false },
+    { id: "user_carl", username: "carl", role: "user", couple_id: "c1", pid_nonce: "bb".repeat(16) },
+  ];
+  tables.chat_messages = [];
+  const alicePid = `u:user_alice.${"aa".repeat(16)}`;
+  const tok = (pid: string, u: string, role: any = "partner") => createServerSession({ username: u, coupleId: "c1", role, pid } as any);
+  const withOp = (op: string | undefined, body: any, headers: Record<string, string> = {}) => ({ ...req(body, headers), query: op ? { op } : {} });
+  // no session: every operation is refused
+  for (const op of ["refresh-token", "resolve-participant", undefined]) {
+    const r = mockRes();
+    await proxyEntry(withOp(op, op ? {} : { table: "chat_messages", action: "select" }), r);
+    assert.equal(r.statusCode, 401, `op ${op}`);
+  }
+  // guests are refused for the two identity operations
+  for (const op of ["refresh-token", "resolve-participant"]) {
+    const r = mockRes();
+    await proxyEntry(withOp(op, { usernames: ["carl"] }, { "x-server-session": tok(alicePid, "alice", "guest") }), r);
+    assert.equal(r.statusCode, 403, `guest ${op}`);
+  }
+  // refresh through the dispatcher behaves like the dedicated handler
+  const rf = mockRes();
+  await proxyEntry(withOp("refresh-token", {}, { "x-server-session": tok(alicePid, "alice") }), rf);
+  assert.equal(rf.body.success, true);
+  assert.equal(rf.body.globalChat, false);
+  const stale = mockRes();
+  await proxyEntry(withOp("refresh-token", {}, { "x-server-session": tok(`u:user_alice.${"cc".repeat(16)}`, "alice") }), stale);
+  assert.equal(stale.statusCode, 409);
+  // participant lookup: body validation and result
+  const bad = mockRes();
+  await proxyEntry(withOp("resolve-participant", { usernames: [] }, { "x-server-session": tok(alicePid, "alice") }), bad);
+  assert.equal(bad.statusCode, 400);
+  const ok = mockRes();
+  await proxyEntry(withOp("resolve-participant", { usernames: ["carl"] }, { "x-server-session": tok(alicePid, "alice") }), ok);
+  assert.equal(ok.body.participants.carl.pid, `u:user_carl.${"bb".repeat(16)}`);
+  // an unknown op is refused (400) and never reaches the database proxy; a missing op is the normal proxy
+  const unk = mockRes();
+  await proxyEntry(withOp("nope", { table: "chat_messages", action: "select" }, { "x-server-session": tok(alicePid, "alice") }), unk);
+  assert.equal(unk.statusCode, 400);
+  assert.equal(unk.body.data, undefined);
+  const arr = mockRes();
+  await proxyEntry({ ...withOp(undefined, { table: "chat_messages", action: "select" }, { "x-server-session": tok(alicePid, "alice") }), query: { op: ["refresh-token", "x"] } }, arr);
+  assert.equal(arr.statusCode, 400);
+  const px = mockRes();
+  await proxyEntry(withOp(undefined, { table: "chat_messages", action: "select" }, { "x-server-session": tok(alicePid, "alice") }), px);
+  assert.equal(px.body.success, true);
+  assert.deepEqual(px.body.data, []);
+  // body of a proxy call sent with an identity op is not interpreted as a table query
+  const mix = mockRes();
+  await proxyEntry(withOp("resolve-participant", { table: "user_accounts", action: "select" }, { "x-server-session": tok(alicePid, "alice") }), mix);
+  assert.equal(mix.statusCode, 400);
+});

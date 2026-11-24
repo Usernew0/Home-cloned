@@ -179,10 +179,11 @@ async function globalLoungeOpen(session: any): Promise<boolean> {
 
 /** Single entry for /api/proxy: two small endpoints share it so the deployment stays within the 12-function limit of the Vercel plan. */
 export async function proxyEntry(req: any, res: any) {
-  const op = String(req.query?.op || "");
-  if (op === "refresh-token") return refreshFirebaseToken(req, res);
-  if (op === "resolve-participant") return resolveParticipant(req, res);
-  return proxy(req, res);
+  const raw = req.query?.op;
+  if (raw === undefined || raw === "") return proxy(req, res); // the normal database proxy
+  if (raw === "refresh-token") return refreshFirebaseToken(req, res);
+  if (raw === "resolve-participant") return resolveParticipant(req, res);
+  return res.status(400).json({ success: false, error: "Unknown operation" });
 }
 
 export async function proxy(req: any, res: any) {
