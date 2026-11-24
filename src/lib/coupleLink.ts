@@ -12,7 +12,12 @@ export function findTenantForUser<T extends LinkTenant>(user: LinkUser, tenants:
     if (byId) return byId;
   }
   const name = norm(user.username);
-  const byName = tenants.filter((t) => norm(t.partner1) === name || (t.partner2 && norm(t.partner2) === name));
+  // A tenant that carries a different explicit couple id than the user is a different space: never match it by name.
+  const byName = tenants.filter(
+    (t) =>
+      (norm(t.partner1) === name || (t.partner2 && norm(t.partner2) === name)) &&
+      (!user.coupleId || !t.coupleId || t.coupleId === user.coupleId),
+  );
   return byName.find((t) => t.partner1 && t.partner2) || byName[0];
 }
 

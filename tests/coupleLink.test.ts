@@ -23,3 +23,10 @@ test('name fallback prefers a two-person tenant and falls back to same-couple us
  assert.equal(findTenantForUser(u,tenants)!.coupleId,'c_joint');
  assert.equal(partnerNameFor({id:'1',username:'A',coupleId:'z'},[{id:'1',username:'A',coupleId:'z'},{id:'2',username:'B',coupleId:'z'}],[]),'B');
 });
+
+test('name fallback never crosses into a tenant with a different explicit couple id',()=>{
+ const u={id:'1',username:'Ebrahimtest',coupleId:'c_other'};
+ assert.equal(findTenantForUser(u,tenants),undefined);
+ assert.equal(partnerNameFor(u,[u],tenants),undefined);
+ assert.equal(findTenantForUser({id:'9',username:'Ebrahimtest'},tenants)!.coupleId,'c_joint');
+});
