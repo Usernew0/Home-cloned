@@ -9,9 +9,9 @@ const mk=(t:any,loaded:boolean,users:any[])=>renderToStaticMarkup(React.createEl
 const users=[{id:'1',username:'E',coupleId:'j'}];
 test('production row: label only when loaded and unlinked; Unlink always present; no dimming or deletion wording',()=>{
  const solo={coupleId:'s',coupleName:'solo',partner1:'E',partner2:''};
- const a=mk(solo,true,users); assert.match(a,/No accounts currently linked/); assert.match(a,/Unlink/); assert.doesNotMatch(a,/opacity-60|unused|old space/i);
+ const a=mk(solo,true,users); assert.match(a,/No accounts currently linked/); assert.match(a,/Unlink/); assert.match(a,/<button[^>]*disabled[^>]*>(?:(?!<\/button>).)*Unlink/s); assert.doesNotMatch(a,/opacity-60|unused|old space/i);
  assert.doesNotMatch(mk(solo,false,users),/No accounts currently linked/);
  assert.doesNotMatch(mk(solo,true,[]),/No accounts currently linked/);
  const joint={coupleId:'j',coupleName:'joint',partner1:'E',partner2:'Q'};
- const b=mk(joint,true,users); assert.doesNotMatch(b,/No accounts currently linked/); assert.match(b,/Unlink/);
+ const b=mk(joint,true,users); assert.doesNotMatch(b,/No accounts currently linked/); assert.match(b,/Unlink/); assert.doesNotMatch(b,/<button[^>]*disabled=""[^>]*>(?:(?!<\/button>).)*Unlink/s);
 });

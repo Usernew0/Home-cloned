@@ -45,3 +45,13 @@ export function isTenantInUse(tenant: LinkTenant, users: LinkUser[]): boolean {
 export function isSpaceUnlinked(tenant: LinkTenant, users: LinkUser[], accountsLoaded: boolean): boolean {
   return accountsLoaded && users.length > 0 && !isTenantInUse(tenant, users);
 }
+
+/**
+ * Which accounts an Unlink on this space may change: only accounts whose coupleId IS this space.
+ * Never match by name (a leftover solo row shares a name with an account that lives in another space).
+ * No linked accounts means there is nothing to unlink, so the caller must not delete the record either.
+ */
+export function unlinkTargets<U extends LinkUser>(tenant: LinkTenant, users: U[]): { users: U[]; canUnlink: boolean } {
+  const targets = tenant.coupleId ? users.filter((u) => u.coupleId === tenant.coupleId) : [];
+  return { users: targets, canUnlink: targets.length > 0 };
+}

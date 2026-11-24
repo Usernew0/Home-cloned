@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { CoupleTenantRow } from "./CoupleTenantRow";
-import { findTenantForUser, partnerNameFor, isSpaceUnlinked } from "../lib/coupleLink";
+import { findTenantForUser, partnerNameFor, isSpaceUnlinked, unlinkTargets } from "../lib/coupleLink";
 import schemaSql from '../../supabase_schema.sql?raw';
 import { motion, AnimatePresence } from "motion/react";
 import {
@@ -2508,8 +2508,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
     setUserErrorMsg(null);
     setIsSyncing(true);
     try {
-      // 1. Unlink user accounts if they refer to this coupleId
-      const affectedUsers = userAccounts.filter((u) => u.coupleId === tenant.coupleId || u.username.toLowerCase() === tenant.partner1.toLowerCase() || u.username.toLowerCase() === tenant.partner2.toLowerCase());
+      // 1. Only accounts that really live in this space are unlinked (never matched by name).
+      const { users: affectedUsers, canUnlink } = unlinkTargets(tenant, userAccounts);
+      if (!canUnlink) {
+        setUserErrorMsg("No account is linked to this space, so there is nothing to unlink. Nothing was changed or deleted.");
+        setIsSyncing(false);
+        return;
+      }
       for (const u of affectedUsers) {
         const individualCoupleId = `couple_${u.username.toLowerCase()}_${Date.now()}`;
         await saveUserAccountDoc({ ...u, coupleId: individualCoupleId });

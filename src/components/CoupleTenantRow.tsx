@@ -98,7 +98,7 @@ export function CoupleTenantRow({ tenant, unlinkedSpace, isSyncing, subscription
                         </button>
                       )}
 
-                                            <button type="button" onClick={() => onUnlink(tenant)} disabled={isSyncing} className="text-[11px] text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 px-2.5 py-1 rounded-xl transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50" title="Unlink these partners">
+                                            <button type="button" onClick={() => onUnlink(tenant)} disabled={isSyncing || unlinkedSpace} title={unlinkedSpace ? "No account is linked to this space, so there is nothing to unlink. This button does not delete spaces." : "Unlink these partners"} className="text-[11px] text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 px-2.5 py-1 rounded-xl transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50">
                         <Unlink className="w-3 h-3" />
                         <span>Unlink</span>
                       </button>

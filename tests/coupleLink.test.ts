@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {findTenantForUser, partnerNameFor, isTenantInUse, isSpaceUnlinked} from '../src/lib/coupleLink.ts';
+import {findTenantForUser, partnerNameFor, isTenantInUse, isSpaceUnlinked, unlinkTargets} from '../src/lib/coupleLink.ts';
 
 const tenants=[
  {coupleId:'c_solo_e',partner1:'Ebrahimtest',partner2:''},
@@ -42,4 +42,13 @@ test('unlinked label needs a server-loaded, non-empty account list',()=>{
  assert.equal(isSpaceUnlinked(tenants[2],users,true),false);
  assert.equal(isSpaceUnlinked(tenants[0],users,false),false);   // still loading / cache only
  assert.equal(isSpaceUnlinked(tenants[0],[],true),false);       // empty or failed load
+});
+
+test('regression: Unlink never touches an account by name and never acts on a space with no linked accounts',()=>{
+ const us=[{id:'1',username:'Ebrahimtest',coupleId:'c_joint'},{id:'2',username:'Qq',coupleId:'c_joint'}];
+ const solo=unlinkTargets(tenants[0],us);   // leftover solo row that lists Ebrahimtest as partner1
+ assert.equal(solo.canUnlink,false); assert.equal(solo.users.length,0);
+ const joint=unlinkTargets(tenants[2],us);
+ assert.equal(joint.canUnlink,true); assert.deepEqual(joint.users.map(u=>u.username),['Ebrahimtest','Qq']);
+ assert.equal(unlinkTargets({partner1:'x'} as any,us).canUnlink,false);
 });
