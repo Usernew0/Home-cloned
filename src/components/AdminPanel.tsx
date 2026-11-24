@@ -2746,8 +2746,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, adminSetti
       await logActivity(currentAdmin, "admin_credentials_updated", logMsg || "Updated admin credentials in Firestore & Supabase.");
       setAdminSuccessMsg("Admin portal credentials synchronized to database successfully!");
       setTimeout(() => setAdminSuccessMsg(null), 4000);
-    } catch (err) {
-      setAdminErrorMsg("Failed to save admin credentials to database.");
+    } catch (err: any) {
+      const reason = typeof err?.message === "string" ? err.message.slice(0, 160) : "";
+      setAdminErrorMsg(reason ? `Failed to save admin credentials to database: ${reason}` : "Failed to save admin credentials to database.");
     } finally {
       setIsSyncing(false);
     }
