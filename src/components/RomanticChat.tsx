@@ -4,7 +4,7 @@ import { Send, Heart, Trash2, CornerUpLeft, X, Sparkles, Smile, Mic, AlertCircle
 import { jsPDF } from 'jspdf';
 import JSZip from 'jszip';
 import { ChatMessage, ChatGroup, UserPresence, UserAccount, AdminSetting } from '../types';
-import { uploadChatImage, saveChatMessageDoc, saveUserAccountDoc, subscribeToChatGroups, saveChatGroupDoc, deleteChatGroupDoc, updateUserPresenceDoc } from '../lib/syncService';
+import { uploadChatImage, saveChatMessageDoc, saveUserAccountDoc, subscribeToChatGroups, saveChatGroupDoc, joinChatGroupByCode, deleteChatGroupDoc, updateUserPresenceDoc } from '../lib/syncService';
 import { EmojiPicker } from './EmojiPicker';
 import { HorizontalScrollWrapper } from './HorizontalScrollWrapper';
 
@@ -579,7 +579,7 @@ export const RomanticChat: React.FC<RomanticChatProps> = ({
     const me = currentSender.trim();
     const invitedMembers = selectedGroupMembers.filter(m => m.toLowerCase().trim() !== me.toLowerCase());
 
-    const inviteCode = `GRP-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const inviteCode = `GRP-${Array.from(crypto.getRandomValues(new Uint8Array(10))).map((b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
     const nowIso = new Date().toISOString();
     const initialJoinedAt: Record<string, string> = {};
     const initialCanSeePastHistory: Record<string, boolean> = {};
@@ -587,7 +587,7 @@ export const RomanticChat: React.FC<RomanticChatProps> = ({
     initialCanSeePastHistory[me.toLowerCase().trim()] = true;
 
     const newGroup: ChatGroup = {
-      id: `group_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      id: `group_${Array.from(crypto.getRandomValues(new Uint8Array(12))).map((b) => b.toString(16).padStart(2, '0')).join('')}`,
       name: newGroupName.trim(),
       description: newGroupDesc.trim() || undefined,
       createdBy: me,
@@ -635,58 +635,26 @@ export const RomanticChat: React.FC<RomanticChatProps> = ({
     }
     code = code.trim().toUpperCase();
 
-    const targetGroup = chatGroups.find(
-      g => g.inviteCode?.toUpperCase() === code || g.id.toUpperCase() === code
-    );
-
-    if (!targetGroup) {
-      alert("Invalid group invite code or link. Please verify the code and try again.");
-      return;
-    }
-
     const me = currentSender.trim();
     const meNorm = me.toLowerCase();
-    const isTargetAdmin = (targetGroup.admins || []).map(a => a.toLowerCase().trim()).includes(meNorm) || targetGroup.createdBy?.toLowerCase().trim() === meNorm;
-
-    if (targetGroup.isInviteLinkEnabled === false && !isTargetAdmin) {
-      alert("Joining via invite link or code has been disabled for members by the group administrator.");
-      return;
-    }
-
-    if ((targetGroup.members || []).map(m => m.toLowerCase().trim()).includes(meNorm)) {
-      setActivePartner(targetGroup.id);
+    // Already a member (the list only holds groups I belong to or am invited to): just open it.
+    const own = chatGroups.find(g => g.inviteCode?.toUpperCase() === code && (g.members || []).map(m => m.toLowerCase().trim()).includes(meNorm));
+    if (own) {
+      setActivePartner(own.id);
       setIsCreateGroupModalOpen(false);
       setJoinGroupInput('');
       return;
     }
-
-    const updatedMembers = [...(targetGroup.members || []), me];
-    const canSeePast = targetGroup.historyVisibleToNewMembers !== false;
-    const updatedJoinedAt = {
-      ...(targetGroup.memberJoinedAt || {}),
-      [meNorm]: new Date().toISOString()
-    };
-    const updatedCanSeePast = {
-      ...(targetGroup.memberCanSeePastHistory || {}),
-      [meNorm]: canSeePast
-    };
-    const updatedGroup: ChatGroup = {
-      ...targetGroup,
-      members: updatedMembers,
-      memberJoinedAt: updatedJoinedAt,
-      memberCanSeePastHistory: updatedCanSeePast
-    };
-
-    try {
-      await saveChatGroupDoc(updatedGroup);
-      setChatGroups(prev => prev.map(g => g.id === updatedGroup.id ? updatedGroup : g));
-      sendGroupSystemMessage(targetGroup.id, `${me} joined the group via invite code`);
-      setActivePartner(targetGroup.id);
-      setIsCreateGroupModalOpen(false);
-      setJoinGroupInput('');
-    } catch (err) {
-      console.error("Error joining group by code:", err);
+    // Otherwise the code itself is the proof: the rules accept a self-join only with a code that matches the group's current invite code.
+    const joined = await joinChatGroupByCode(code, me);
+    if (joined.ok === false) {
+      alert("Invalid or disabled group invite code or link. Please verify the code and try again.");
+      return;
     }
+    sendGroupSystemMessage(joined.groupId, `${me} joined the group via invite code`);
+    setActivePartner(joined.groupId);
+    setIsCreateGroupModalOpen(false);
+    setJoinGroupInput('');
   };
 
   const handleAddMemberToActiveGroup = async () => {
@@ -898,7 +866,7 @@ export const RomanticChat: React.FC<RomanticChatProps> = ({
 
   const handleResetGroupInviteCode = async () => {
     if (!activeGroup || !isGroupAdmin) return;
-    const newCode = `GRP-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const newCode = `GRP-${Array.from(crypto.getRandomValues(new Uint8Array(10))).map((b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
     const updatedGroup: ChatGroup = {
       ...activeGroup,
       inviteCode: newCode
@@ -959,7 +927,7 @@ export const RomanticChat: React.FC<RomanticChatProps> = ({
     if (!activeGroup) return;
     let inviteCode = activeGroup.inviteCode;
     if (!inviteCode) {
-      inviteCode = `GRP-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+      inviteCode = `GRP-${Array.from(crypto.getRandomValues(new Uint8Array(10))).map((b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
       const updatedGroup = { ...activeGroup, inviteCode };
       try {
         await saveChatGroupDoc(updatedGroup);

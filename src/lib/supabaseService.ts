@@ -1550,6 +1550,11 @@ export async function updateDataCoupleId(oldCoupleId: string, newCoupleId: strin
     const tables = ["milestones", "date_plans", "memories", "letters", "couple_questions", "celebration_cards", "user_accounts", "activity_logs", "chat_messages"];
     for (const table of tables) {
       try {
+        if (table === "chat_messages") {
+          // Chat rows are only writable through the server proxy (admin session); direct anon-key writes are refused by the database.
+          if (oldCoupleId) await proxyCall({ table, action: "update", data: { couple_id: newCoupleId }, filters: [{ column: "couple_id", operator: "eq", value: oldCoupleId }] });
+          continue;
+        }
         if (oldCoupleId) {
           await supabase.from(table).update({ couple_id: newCoupleId }).eq("couple_id", oldCoupleId);
         }

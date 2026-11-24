@@ -361,3 +361,38 @@ test('regression: dedicated admin edit preserves omitted password and stored two
  assert.equal(sent.body.admin_accounts[0].password,tables.admin_settings[0].admin_accounts[0].password);
  assert.equal(sent.body.admin_accounts[0].twoFactorSecret,'synthetic-secret');
 });
+
+test("global lounge switch: proxy hides and refuses global chat for a closed account, refresh endpoint reports it", async () => {
+  reset();
+  const { refreshFirebaseToken } = await import("../server/handlers.ts");
+  tables.user_accounts = [
+    { id: "user_alice", username: "alice", role: "user", couple_id: "c1", pid_nonce: "aa".repeat(16), enable_global_chat: false },
+    { id: "user_carl", username: "carl", role: "user", couple_id: "c1", pid_nonce: "bb".repeat(16) },
+  ];
+  tables.chat_messages = [
+    { id: "g1", sender: "carl", receiver: "global", conversation_id: "global", couple_id: "c1", sender_id: null, receiver_id: null, content: "hi all" },
+    { id: "d1", sender: "carl", receiver: "alice", conversation_id: "alice_carl", couple_id: "c1", sender_id: `u:user_carl.${"bb".repeat(16)}`, receiver_id: `u:user_alice.${"aa".repeat(16)}`, content: "dm" },
+  ];
+  const alicePid = `u:user_alice.${"aa".repeat(16)}`, carlPid = `u:user_carl.${"bb".repeat(16)}`;
+  const tok = (pid: string, u: string) => createServerSession({ username: u, coupleId: "c1", role: "partner", pid } as any);
+  const a = mockRes();
+  await proxy(req({ table: "chat_messages", action: "select" }, { "x-server-session": tok(alicePid, "alice") }), a);
+  assert.deepEqual(a.body.data.map((r: any) => r.id), ["d1"]);               // DM stays, lounge hidden
+  const c = mockRes();
+  await proxy(req({ table: "chat_messages", action: "select" }, { "x-server-session": tok(carlPid, "carl") }), c);
+  assert.deepEqual(c.body.data.map((r: any) => r.id).sort(), ["d1", "g1"]);  // open account sees both
+  const w = mockRes();
+  await proxy(req({ table: "chat_messages", action: "insert", data: { id: "g2", sender: "alice", receiver: "global", conversation_id: "global", couple_id: "c1", content: "x" } }, { "x-server-session": tok(alicePid, "alice") }), w);
+  assert.equal(w.statusCode, 403);
+  const r1 = mockRes();
+  await refreshFirebaseToken(req({}, { "x-server-session": tok(alicePid, "alice") }), r1);
+  assert.equal(r1.body.success, true);
+  assert.equal(r1.body.globalChat, false);
+  const r2 = mockRes();
+  await refreshFirebaseToken(req({}, { "x-server-session": tok(carlPid, "carl") }), r2);
+  assert.equal(r2.body.globalChat, true);
+  // a stale session (account recreated: different nonce) gets nothing
+  const r3 = mockRes();
+  await refreshFirebaseToken(req({}, { "x-server-session": tok(`u:user_alice.${"cc".repeat(16)}`, "alice") }), r3);
+  assert.equal(r3.statusCode, 409);
+});

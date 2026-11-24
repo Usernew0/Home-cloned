@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { refreshFirebaseSession } from '../lib/firebaseScope';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   User,
@@ -252,6 +253,7 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
       }
 
       await saveUserAccountDoc(updatedUser);
+      void refreshFirebaseSession();
 
       // Auto-sync into Telegram whitelist via the useTelegramWhitelistSync hook
       if (cleanTg) {

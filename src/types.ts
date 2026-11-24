@@ -87,6 +87,11 @@ export interface ChatMessage {
   id: string;
   coupleId?: string;
   sender: string;
+  /** Permanent participant ids (server-minted); privacy is decided on these, never on the username strings. */
+  senderId?: string;
+  /** Global/group messages carry the author's permanent id here (never senderId/receiverId, which mark private 1:1 rows). */
+  authorId?: string;
+  receiverId?: string;
   receiver?: string;
   conversationId?: string;
   content: string;

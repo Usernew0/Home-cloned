@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, Suspense, lazy } from "react";
-import { endFirebaseSession } from "./lib/firebaseScope";
+import { endFirebaseSession, ensureFirebaseRefresh, getFirebaseScope } from "./lib/firebaseScope";
+import { resolveParticipantPid } from "./lib/participants";
 import { motion, AnimatePresence } from "motion/react";
 import { Heart, Calendar, Image as ImageIcon, Images, Mail, Sparkles, Clock, Gift, HeartHandshake, ChevronRight, MessageSquareHeart, Lock, LogOut, Bell, BellOff, X, ChevronLeft, Volume2, VolumeX, HelpCircle, Menu, Grid, ChevronDown, ChevronUp, Crown, User, Music, Headphones, Disc } from "lucide-react";
 
@@ -393,6 +394,8 @@ export default function App() {
   }, [adminSettings]);
 
   // Synchronize global preset music tracks from Admin Settings
+  useEffect(() => { if (getFirebaseScope()) ensureFirebaseRefresh(); }, []);
+
   useEffect(() => {
     const globalMusicDoc = adminSettings.find((s) => s.id === "globalMusicTracks");
     if (globalMusicDoc?.globalMusicTracks && Array.isArray(globalMusicDoc.globalMusicTracks)) {
@@ -599,7 +602,7 @@ export default function App() {
       const receiver = (m.receiver || "").toLowerCase().trim();
       const conversationId = (m.conversationId || "").toLowerCase().trim();
 
-      if (sender === cleanUser || receiver === cleanUser || receiver.startsWith("group_") || conversationId.startsWith("group_") || receiver === "global" || conversationId === "global" || (mCoupleId && mCoupleId === currentCoupleId)) {
+      if (sender === cleanUser || receiver === cleanUser || receiver.startsWith("group_") || conversationId.startsWith("group_") || receiver === "global" || conversationId === "global" || (!receiver && !conversationId && mCoupleId && mCoupleId === currentCoupleId)) {
         seen.add(m.id);
         return true;
       }
@@ -1598,8 +1601,19 @@ export default function App() {
   };
 
   // Chat message handlers
-  const handleSendChatMessage = (content: string, replyTo?: ChatMessage, audioUrl?: string, audioDuration?: number, imageUrl?: string, imageFile?: File, receiver?: string) => {
+  const handleSendChatMessage = async (content: string, replyTo?: ChatMessage, audioUrl?: string, audioDuration?: number, imageUrl?: string, imageFile?: File, receiver?: string) => {
     const msgId = "chat-" + Date.now() + "-" + Math.random().toString(36).substr(2, 9);
+
+    // Private messages are bound to permanent account ids: mine from the signed-in session, the recipient's resolved by the server.
+    const senderId = getFirebaseScope()?.pid || "";
+    if (!senderId) { alert("Please sign out and sign in again to use chat."); return; }
+    const isDirectSend = !!receiver && receiver !== "global" && !receiver.startsWith("group_");
+    let receiverId: string | undefined;
+    if (isDirectSend) {
+      const resolved = await resolveParticipantPid(receiver!);
+      if (!resolved) { alert("Could not verify the recipient's account, so the message was not sent."); return; }
+      receiverId = resolved;
+    }
 
     let initialImageUrl = imageUrl;
     if (imageFile) {
@@ -1616,6 +1630,7 @@ export default function App() {
     const newMsg: ChatMessage = {
       id: msgId,
       sender: currentUser,
+      ...(isDirectSend ? { senderId, receiverId } : { authorId: senderId }),
       receiver,
       conversationId,
       content,

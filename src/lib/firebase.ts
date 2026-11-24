@@ -57,7 +57,7 @@ export const db = initializeFirestore(app, {
   experimentalLongPollingOptions: {
     timeoutSeconds: 15
   }
-}, config.firestoreDatabaseId || '(default)');
+}, (config as any).firestoreDatabaseId || '(default)');
 
 // Expose connection status globally so the app UI can display helpful troubleshooting if needed
 export let isFirestoreOnline = true;

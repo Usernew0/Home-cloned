@@ -85,13 +85,23 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, admi
       const data = await res.json().catch(() => ({}));
       if (data.success && data.username) {
         if (supabase && data.supabaseSession?.access_token && data.supabaseSession?.refresh_token) {
-          await supabase.auth.setSession({
-            access_token: data.supabaseSession.access_token,
-            refresh_token: data.supabaseSession.refresh_token,
-          });
+          // Fail closed: only keep a Supabase session whose token names the account that just signed in.
+          let ok = false;
+          try {
+            const md = JSON.parse(atob(String(data.supabaseSession.access_token).split(".")[1].replace(/-/g, "+").replace(/_/g, "/")))?.app_metadata;
+            ok = !!md && (md.pid ?? "") === (data.pid ?? "") && md.couple_id === data.coupleId && md.role === data.role;
+          } catch { ok = false; }
+          if (ok) {
+            await supabase.auth.setSession({
+              access_token: data.supabaseSession.access_token,
+              refresh_token: data.supabaseSession.refresh_token,
+            });
+          } else {
+            await supabase.auth.signOut().catch(() => {});
+          }
         }
         if (data.sessionToken) localStorage.setItem("love_server_session_token", data.sessionToken);
-        await startFirebaseSession({ firebaseToken: data.firebaseToken, coupleId: data.coupleId, role: data.role, username: data.username });
+        await startFirebaseSession({ firebaseToken: data.firebaseToken, coupleId: data.coupleId, role: data.role, username: data.username, pid: data.pid });
         return { success: true, username: data.username };
       }
       return { success: false, requires2fa: !!data.requires2fa, error: data.error, status: res.status };

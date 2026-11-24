@@ -58,6 +58,8 @@ export interface ServerSessionPayload {
   username: string;
   coupleId: string;
   role: "admin" | "partner" | "guest" | "user";
+  /** Permanent participant id (see participant.ts). Empty for sessions minted before it existed. */
+  pid?: string;
   expiresAt: number;
 }
 

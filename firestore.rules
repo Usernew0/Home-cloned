@@ -202,6 +202,10 @@ service cloud.firestore {
     function isAdmin() { return signedIn() && request.auth.token.role == 'admin'; }
     function canWrite() { return signedIn() && request.auth.token.role in ['admin', 'partner', 'user']; }
     function me() { return request.auth.token.username; }
+    // Permanent participant id minted by the server at login (never a username). Empty on tokens minted before it existed.
+    // Per-account lounge switch carried in the signed token (default open). Closing the lounge denies both read and send.
+    function globalOpen() { return request.auth.token.get('globalChat', false) == true; }
+    function pid() { return request.auth.token.get('pid', ''); }
     function sameCouple(data) { return signedIn() && data.get('coupleId', null) == request.auth.token.coupleId; }
 
     match /presence/{username} {
@@ -216,30 +220,161 @@ service cloud.firestore {
     match /typingStatus/{username} { allow read, write: if false; }
     match /notifications/{notificationId} { allow read, write: if false; }
 
-    match /chatGroups/{groupId} {
-      allow read: if isAdmin() || (signedIn() && (me() in resource.data.members || me() in resource.data.get('pendingMembers', [])));
-      allow create: if canWrite() && isValidId(groupId) && incoming().id == groupId && incoming().createdBy == me()
-        && me() in incoming().members && isValidChatGroup(incoming());
-      // Participants may update (accept invite, leave, edit); fine-grained group-admin flags stay client-enforced.
-      allow update: if isAdmin() || (canWrite() && (me() in resource.data.members || me() in resource.data.get('pendingMembers', []))
-        && incoming().id == groupId && incoming().createdBy == resource.data.createdBy && isValidChatGroup(incoming()));
-      allow delete: if isAdmin() || (canWrite() && resource.data.createdBy == me());
+    // Groups: visible and editable by members (and pending invitees) only. App admins get no read or edit access to a group (they may delete
+    // one for moderation). Group-admin powers are enforced here, not only in the client. Membership is still matched on usernames.
+    function isGroupAdmin(g) { return me() == g.createdBy || me() in g.get('admins', []); }
+    function isGroupMember(g) { return me() in g.members; }
+    function isGroupInvitee(g) { return me() in g.get('pendingMembers', []); }
+    // Creator-only soft delete: empties membership and marks the doc; the id then stays reserved forever.
+    function groupTombstone(groupId) {
+      return resource.data.createdBy == me() && incoming().id == groupId && incoming().createdBy == me()
+        && incoming().members == [] && incoming().get('pendingMembers', []) == [] && incoming().get('admins', []) == []
+        && incoming().get('deletedAt', null) is string;
+    }
+    function groupInvariants(groupId) { return incoming().id == groupId && incoming().createdBy == resource.data.createdBy && isValidChatGroup(incoming()); }
+    function mapOk(k) {
+      return !(k in incoming())
+        || (k in resource.data
+            ? incoming()[k].diff(resource.data[k]).affectedKeys().hasOnly([me().lower()])
+            : incoming()[k].keys().hasOnly([me().lower()]));
+    }
+    function mapsOnlyMine() { return mapOk('memberJoinedAt') && mapOk('memberCanSeePastHistory'); }
+    // Nobody can add another person to members directly (consent goes through pendingMembers and the invitee's own accept).
+    function membersChangeOk() {
+      let oldM = resource.data.members.toSet();
+      let newM = incoming().members.toSet();
+      return newM.difference(oldM).hasOnly([me()]) && (!(me() in newM.difference(oldM)) || isGroupInvitee(resource.data));
+    }
+    function selfServiceGroupChange() {
+      let oldM = resource.data.members.toSet();
+      let newM = incoming().members.toSet();
+      let oldP = resource.data.get('pendingMembers', []).toSet();
+      let newP = incoming().get('pendingMembers', []).toSet();
+      let oldMute = resource.data.get('mutedBy', []).toSet();
+      let newMute = incoming().get('mutedBy', []).toSet();
+      return incoming().diff(resource.data).affectedKeys().hasOnly(['members', 'pendingMembers', 'mutedBy', 'memberJoinedAt', 'memberCanSeePastHistory'])
+        && membersChangeOk() && oldM.difference(newM).hasOnly([me()])
+        && oldP.difference(newP).hasOnly([me()])
+        && (newP.difference(oldP).size() == 0
+            || (isGroupMember(resource.data) && resource.data.get('onlyAdminsCanAddMembers', false) != true))
+        && newMute.difference(oldMute).hasOnly([me()]) && oldMute.difference(newMute).hasOnly([me()])
+        && mapsOnlyMine();
+    }
+    // Joining by invite code: the writer must present a code (joinedVia) that maps to THIS group in groupInvites AND equals the group's current
+    // inviteCode, with invite links enabled. They can add only themselves and only their own join-time entries. Existing members/pending are untouched.
+    function joinViaInvite(groupId) {
+      let code = incoming().get('joinedVia', '');
+      return code is string && code.matches('GRP-[A-F0-9]{20}')
+        && exists(/databases/$(database)/documents/groupInvites/$(code))
+        && get(/databases/$(database)/documents/groupInvites/$(code)).data.groupId == groupId
+        && resource.data.get('inviteCode', '') == code
+        && resource.data.get('isInviteLinkEnabled', true) != false
+        && incoming().diff(resource.data).affectedKeys().hasOnly(['members', 'memberJoinedAt', 'memberCanSeePastHistory', 'joinedVia'])
+        && incoming().members.toSet().difference(resource.data.members.toSet()).hasOnly([me()])
+        && resource.data.members.toSet().difference(incoming().members.toSet()).size() == 0
+        && mapsOnlyMine();
     }
 
+    match /groupInvites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create, update: if canWrite() && code.matches('GRP-[A-F0-9]{20}') && incoming().keys().hasOnly(['groupId', 'historyVisible'])
+        && incoming().groupId is string
+        && isGroupAdmin(get(/databases/$(database)/documents/chatGroups/$(incoming().groupId)).data)
+        && get(/databases/$(database)/documents/chatGroups/$(incoming().groupId)).data.get('inviteCode', '') == code;
+      allow delete: if false;
+    }
+
+    match /chatGroups/{groupId} {
+      allow read: if signedIn() && (isGroupMember(resource.data) || isGroupInvitee(resource.data));
+      // Random unguessable ids only (a deleted group's id cannot be recreated by guessing); the creator starts alone, others join by consent.
+      allow create: if canWrite() && groupId.matches('group_[a-f0-9]{24}') && incoming().id == groupId && incoming().createdBy == me()
+        && incoming().members == [me()] && isValidChatGroup(incoming());
+      allow update: if canWrite() && groupInvariants(groupId) && (
+          ((isGroupMember(resource.data) || isGroupInvitee(resource.data))
+            && (selfServiceGroupChange() || (isGroupAdmin(resource.data) && isGroupMember(resource.data) && membersChangeOk())))
+          || joinViaInvite(groupId)
+          || groupTombstone(groupId));
+      // Only the creator deletes a group. App admins have no group powers (a delete would let them recreate and read history).
+      // Groups are never hard-deleted: a removed group id stays taken (tombstone) so nobody can recreate a known id and read its history.
+      allow delete: if false;
+    }
+
+    // Chat privacy model:
+    //  - 1:1 messages (partner chat and cross-couple DMs) are readable ONLY by the sender and the receiver, matched on permanent account ids.
+    //    The sender's couple is NOT a reader: the sender's partner cannot read a DM addressed to someone else.
+    //  - Messages with conversationId 'global' are readable by every signed-in user (the global lounge).
+    //  - Group messages are readable by group members.
+    //  - A message with no receiver and no conversation is readable only by its sender (and admins).
+    // In-app admins get NO special read access to 1:1 messages: they read global/group chat like anyone else and may
+    // moderate (delete) non-1:1 messages only. Operator access (Firebase console, service-account keys) is outside the rules.
+    function chatField(data, key) { return data.get(key, ''); }
+    // Participation is decided on permanent ids only. A row without senderId/receiverId (legacy) is readable by NO ONE through the rules
+    // until an operator-reviewed backfill (admin SDK) assigns ids; there is deliberately no username fallback.
+    function isChatSender(data) { return pid() != '' && data.get('senderId', null) == pid(); }
+    function isChatReceiver(data) { return pid() != '' && data.get('receiverId', null) == pid(); }
+    function isChatParticipant(data) { return isChatSender(data) || isChatReceiver(data); }
+    function validDirectRecipient(data) {
+      return !isDirectChat(data) || (data.get('receiverId', '') is string && data.get('receiverId', '').matches('(u|adm|leg):[^ ]+'));
+    }
+    // Only these fields may change on someone else's message (receiver marking seen, reacting, pinning).
+    function onlyReceiptFields() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seen', 'seenBy', 'seenByTime', 'reaction', 'pinned', 'pinnedAt', 'pinnedBy']);
+    }
+    // Exact, case-sensitive shapes (the proxy and Supabase policies use the same ones). Anything else is a private 1:1 message.
+    function isGlobalMsg(data) { return chatField(data, 'receiver') == 'global' && chatField(data, 'conversationId') == 'global'; }
+    function isGroupMsg(data) { return chatField(data, 'receiver').matches('group_.*') && chatField(data, 'conversationId').matches('group_.*'); }
+    function isUnaddressed(data) { return chatField(data, 'receiver') == '' && chatField(data, 'conversationId') == ''; }
+    // New messages must not mix shapes (a person as receiver with a global/group conversation, or the reverse). Reads of global/group stay
+    // keyed on conversationId alone so those listeners remain provable per query; mixed rows can therefore only come from legacy data.
+    function validRouting(data) {
+      return (chatField(data, 'conversationId') != 'global' || chatField(data, 'receiver') == 'global')
+        && (chatField(data, 'receiver') != 'global' || chatField(data, 'conversationId') == 'global')
+        && (!chatField(data, 'conversationId').matches('group_.*') || chatField(data, 'receiver') == chatField(data, 'conversationId'))
+        && (!chatField(data, 'receiver').matches('group_.*') || chatField(data, 'receiver') == chatField(data, 'conversationId'));
+    }
+    function isDirectChat(data) { return !isGlobalMsg(data) && !isGroupMsg(data) && !isUnaddressed(data); }
+    function chatRoutingUnchanged() {
+      return incoming().get('receiver', null) == resource.data.get('receiver', null)
+        && incoming().get('conversationId', null) == resource.data.get('conversationId', null)
+        && incoming().get('senderId', null) == resource.data.get('senderId', null)
+        && incoming().get('receiverId', null) == resource.data.get('receiverId', null)
+        && incoming().get('authorId', null) == resource.data.get('authorId', null)
+        && incoming().sender == resource.data.sender;
+    }
+
+    function groupOf(data) { return get(/databases/$(database)/documents/chatGroups/$(chatField(data, 'conversationId'))).data; }
+    // Non-direct (global/group) access: global needs the open lounge claim; a group needs current membership.
+    function nonDirectReadable(data) {
+      return (chatField(data, 'conversationId') == 'global' && globalOpen())
+        || (chatField(data, 'conversationId').matches('group_.*') && me() in groupOf(data).members);
+    }
+    // Posting to a group needs membership, and in announcement mode a group admin.
+    function canPostToGroup(data) {
+      return !chatField(data, 'conversationId').matches('group_.*')
+        || (me() in groupOf(data).members && (groupOf(data).get('onlyAdminsCanSend', false) != true || isGroupAdmin(groupOf(data))));
+    }
+    // Global/group rows carry authorId (never senderId/receiverId), so the participant queries for 1:1 chat can never return them.
+    function isAuthor(data) { return pid() != '' && data.get('authorId', null) == pid(); }
+    function noPersonIds(data) { return !('senderId' in data) && !('receiverId' in data); }
+
     match /chatMessages/{messageId} {
-      allow read: if isAdmin() || (signedIn() && (
-        sameCouple(resource.data)
-        || resource.data.sender == me()
-        || resource.data.get('receiver', null) == me()
-        || resource.data.get('conversationId', null) == 'global'
-        || (resource.data.get('conversationId', '').matches('group_.*')
-            && me() in get(/databases/$(database)/documents/chatGroups/$(resource.data.conversationId)).data.members)));
+      allow read: if signedIn() && (isChatParticipant(resource.data) || nonDirectReadable(resource.data));
       allow create: if canWrite() && isValidId(messageId) && incoming().id == messageId && isValidChatMessage(incoming())
-        && incoming().sender == me() && (isAdmin() || sameCouple(incoming()));
-      allow update: if isAdmin() || (canWrite() && isValidId(messageId) && incoming().id == messageId && isValidChatMessage(incoming())
-        && (sameCouple(resource.data) || resource.data.get('receiver', null) == me() || resource.data.sender == me())
-        && incoming().sender == resource.data.sender);
-      allow delete: if isAdmin() || (canWrite() && resource.data.sender == me());
+        && incoming().sender == me() && pid() != '' && validRouting(incoming())
+        && (isAdmin() || sameCouple(incoming()))
+        && (isDirectChat(incoming())
+            ? (incoming().get('senderId', null) == pid() && validDirectRecipient(incoming()) && !('authorId' in incoming()))
+            : (incoming().get('authorId', null) == pid() && noPersonIds(incoming()) && nonDirectReadable(incoming()) && canPostToGroup(incoming())));
+      // Authors edit their own message but never re-route it. The 1:1 receiver, and members of an open group/global room, may only change receipt fields.
+      allow update: if canWrite() && isValidId(messageId) && incoming().id == messageId && isValidChatMessage(incoming())
+        && chatRoutingUnchanged()
+        && (isChatSender(resource.data)
+            || (isAuthor(resource.data) && nonDirectReadable(resource.data))
+            || (isChatReceiver(resource.data) && onlyReceiptFields())
+            || (!isDirectChat(resource.data) && nonDirectReadable(resource.data) && onlyReceiptFields()));
+      // Authors delete their own messages. Admins may moderate (delete) global/group messages, never 1:1 messages.
+      allow delete: if canWrite() && (isChatSender(resource.data) || (isAuthor(resource.data) && nonDirectReadable(resource.data)) || (isAdmin() && !isDirectChat(resource.data)));
     }
 
     match /milestones/{docId} {

@@ -1,16 +1,4 @@
-import { 
-  collection, 
-  doc, 
-  setDoc, 
-  deleteDoc, 
-  onSnapshot, 
-  query,
-  orderBy,
-  limit,
-  getDocs,
-  where,
-  getDocFromServer
-} from 'firebase/firestore';
+import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, limit, getDocs, where, getDocFromServer, getDoc, updateDoc, arrayUnion, FieldPath } from 'firebase/firestore';
 import { getFirebaseScope } from './firebaseScope';
 import { db, isFirestoreOnline } from './firebase';
 import { 
@@ -121,16 +109,14 @@ export function subscribeToChatMessages(callback: (data: ChatMessage[]) => void)
   const scope = getFirebaseScope();
   const onErr = (error: unknown) => handleFirestoreError(error, OperationType.GET, 'chatMessages');
   const chats = collection(db, 'chatMessages');
-  if (!scope || scope.role === 'admin') {
-    // Query limited to 1000 chat messages to optimize reads and provide rich history across DMs and group chats
-    return onSnapshot(query(chats, orderBy('timestamp', 'asc'), limit(1000)), (snapshot) => {
-      const list: ChatMessage[] = [];
-      snapshot.forEach((doc) => list.push(normalizeCoupleId(doc.data() as ChatMessage)));
-      callback(list);
-    }, onErr);
+  if (!scope) {
+    // Not signed in: the rules deny this; keep a harmless single listener so the caller gets an error callback.
+    return onSnapshot(query(chats, orderBy('timestamp', 'asc'), limit(1)), () => callback([]), onErr);
   }
 
-  // Non-admins: union of (own couple) + (sent by me) + (sent to me) + (global lounge) + (groups I belong to).
+  // Everyone, admins included (admins get no special read access to 1:1 messages): union of (sent by me) + (sent to me) + (global lounge) + (groups I belong to).
+  // There is deliberately NO couple-wide listener: a 1:1 message is private to its two participants, so a couple-wide query
+  // would be rejected by the rules. Partner chat is a message addressed to the partner (received/sent queries cover it).
   // Each is a separate constrained query so the security rules can prove access per query.
   const buckets = new Map<string, ChatMessage[]>();
   const emit = () => {
@@ -146,9 +132,8 @@ export function subscribeToChatMessages(callback: (data: ChatMessage[]) => void)
       emit();
     }, onErr);
   const unsubs: Array<() => void> = [
-    listen('couple', 'coupleId', scope.coupleId),
-    listen('sent', 'sender', scope.username),
-    listen('received', 'receiver', scope.username),
+    // 1:1 messages are matched on the permanent participant id. A session without one (signed in before ids existed) sees no 1:1 messages until it signs in again.
+    ...(scope.pid ? [listen('sent', 'senderId', scope.pid), listen('received', 'receiverId', scope.pid)] : []),
     listen('global', 'conversationId', 'global'),
   ];
   const groupUnsubs = new Map<string, () => void>();
@@ -184,7 +169,7 @@ export async function deleteChatMessageDoc(id: string) {
 export function subscribeToChatGroups(callback: (data: ChatGroup[]) => void) {
   const scope = getFirebaseScope();
   const onErr = (error: unknown) => handleFirestoreError(error, OperationType.GET, 'chatGroups');
-  if (!scope || scope.role === 'admin') {
+  if (!scope) {
     return onSnapshot(collection(db, 'chatGroups'), (snapshot) => {
       const list: ChatGroup[] = [];
       snapshot.forEach((doc) => list.push(doc.data() as ChatGroup));
@@ -194,7 +179,11 @@ export function subscribeToChatGroups(callback: (data: ChatGroup[]) => void) {
   // Members and pending invitees only. Two listeners, merged by id.
   const member = new Map<string, ChatGroup>();
   const pending = new Map<string, ChatGroup>();
-  const emit = () => callback(Array.from(new Map([...pending, ...member]).values()));
+  const emit = () => {
+    const all = Array.from(new Map([...pending, ...member]).values());
+    callback(all);
+    all.forEach((g) => { void registerGroupInvite(g); });
+  };
   const fill = (m: Map<string, ChatGroup>) => (snapshot: any) => {
     m.clear();
     snapshot.forEach((d: any) => m.set(d.id, d.data() as ChatGroup));
@@ -205,9 +194,46 @@ export function subscribeToChatGroups(callback: (data: ChatGroup[]) => void) {
   return () => { u1(); u2(); };
 }
 
+const registeredInvites = new Set<string>();
+/** Registers code -> group so a non-member holding the code can join (the rules verify it against the group's current inviteCode). Group admins only. */
+export async function registerGroupInvite(group: ChatGroup) {
+  const scope = getFirebaseScope();
+  const code = group.inviteCode?.toUpperCase();
+  if (!scope || !code || !/^GRP-[A-F0-9]{20}$/.test(code)) return;
+  const me = scope.username;
+  const isAdm = group.createdBy === me || (group.admins || []).includes(me);
+  const key = `${code}:${group.id}:${group.historyVisibleToNewMembers !== false}`;
+  if (!isAdm || registeredInvites.has(key)) return;
+  try {
+    await setDoc(doc(db, 'groupInvites', code), { groupId: group.id, historyVisible: group.historyVisibleToNewMembers !== false });
+    registeredInvites.add(key);
+  } catch { /* retried on the next save/subscription */ }
+}
+
+export async function joinChatGroupByCode(rawCode: string, username: string): Promise<{ ok: true; groupId: string } | { ok: false; reason: 'invalid' | 'disabled' }> {
+  const code = rawCode.trim().toUpperCase();
+  if (!/^GRP-[A-F0-9]{20}$/.test(code)) return { ok: false, reason: 'invalid' };
+  try {
+    const inv = await getDoc(doc(db, 'groupInvites', code));
+    if (!inv.exists()) return { ok: false, reason: 'invalid' };
+    const { groupId, historyVisible } = inv.data() as { groupId: string; historyVisible?: boolean };
+    const me = username.trim();
+    const meKey = me.toLowerCase();
+    await updateDoc(doc(db, 'chatGroups', groupId),
+      'members', arrayUnion(me),
+      'joinedVia', code,
+      new FieldPath('memberJoinedAt', meKey), new Date().toISOString(),
+      new FieldPath('memberCanSeePastHistory', meKey), historyVisible !== false);
+    return { ok: true, groupId };
+  } catch (err: any) {
+    return { ok: false, reason: 'invalid' };
+  }
+}
+
 export async function saveChatGroupDoc(group: ChatGroup) {
   try {
     await setDoc(doc(db, 'chatGroups', group.id), cleanUndefined(group));
+    void registerGroupInvite(group);
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, `chatGroups/${group.id}`);
   }
@@ -215,9 +241,10 @@ export async function saveChatGroupDoc(group: ChatGroup) {
 
 export async function deleteChatGroupDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'chatGroups', id));
+    // Soft delete (tombstone): the id stays reserved so it can never be recreated and read back.
+    await updateDoc(doc(db, 'chatGroups', id), { members: [], pendingMembers: [], admins: [], deletedAt: new Date().toISOString() });
   } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `chatGroups/${id}`);
+    handleFirestoreError(err, OperationType.UPDATE, `chatGroups/${id}`);
   }
 }
 
@@ -677,9 +704,20 @@ export async function getFirestoreCoupleTenants(): Promise<CoupleTenant[]> {
 
 export async function getFirestoreChatMessages(): Promise<ChatMessage[]> {
   try {
-    const snapshot = await getDocs(scopedCol('chatMessages'));
+    const scope = getFirebaseScope();
     const list: ChatMessage[] = [];
-    snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as ChatMessage)));
+    if (!scope) return list;
+    // Everyone (admins included) can only list messages they sent or received (the rules prove access per query).
+    const chats = collection(db, 'chatMessages');
+    const seen = new Set<string>();
+    if (!scope.pid) return list;
+    for (const field of ['senderId', 'receiverId']) {
+      const snapshot = await getDocs(query(chats, where(field, '==', scope.pid)));
+      snapshot.forEach(d => {
+        const m = normalizeCoupleId(d.data() as ChatMessage);
+        if (!seen.has(m.id)) { seen.add(m.id); list.push(m); }
+      });
+    }
     return list;
   } catch (err) {
     console.warn("Failed to fetch Firestore chatMessages:", err);

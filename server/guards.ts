@@ -42,6 +42,8 @@ export function rolesForPath(method: string, path: string): Role[] | null {
   if (p === "/auth/two-factor") return ANY_SESSION; // handler re-checks role + password
   if (p === "/telegram/webhook" && method === "POST") return null;
   if (p === "/proxy" || p === "/admin-settings") return ANY_SESSION; // handlers re-check role/scope
+  if (p === "/auth/refresh-firebase-token") return MEMBERS; // handler re-checks role
+  if (p === "/chat/resolve-participant") return MEMBERS; // handler re-checks role
   if (p === "/telegram/send") return MEMBERS;
   if (p === "/upload-audio" || p === "/generate-date" || p === "/stripe/checkout") return MEMBERS;
   if (p.startsWith("/telegram/")) return ADMIN; // test, diagnose, updates, senders*, webhook/set|info|delete

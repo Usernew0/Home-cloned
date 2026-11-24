@@ -262,6 +262,9 @@ CREATE POLICY "Celebration cards access policy" ON public.celebration_cards FOR 
 -- 12. Telegram bot linking (chat ID saved automatically by /id and /confirm)
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
 ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS telegram_username TEXT;
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS enable_global_chat BOOLEAN DEFAULT TRUE;
+-- Server-generated, never client-writable: part of the permanent private-chat id (existing rows each get their own random value here).
+ALTER TABLE public.user_accounts ADD COLUMN IF NOT EXISTS pid_nonce TEXT NOT NULL DEFAULT replace(gen_random_uuid()::text, '-', '');
 
 CREATE INDEX IF NOT EXISTS idx_user_accounts_telegram_chat_id
   ON public.user_accounts (telegram_chat_id);
@@ -393,9 +396,34 @@ CREATE POLICY "Authenticated profiles access" ON public.profiles FOR ALL
 USING (auth.role() = 'service_role' OR auth.role() = 'authenticated')
 WITH CHECK (auth.role() = 'service_role' OR auth.role() = 'authenticated');
 
+ALTER TABLE public.chat_messages ADD COLUMN IF NOT EXISTS sender_id TEXT;
+ALTER TABLE public.chat_messages ADD COLUMN IF NOT EXISTS receiver_id TEXT;
+CREATE INDEX IF NOT EXISTS chat_messages_sender_id_idx ON public.chat_messages (sender_id);
+CREATE INDEX IF NOT EXISTS chat_messages_receiver_id_idx ON public.chat_messages (receiver_id);
 ALTER TABLE public.chat_messages ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Chat messages access policy" ON public.chat_messages;
-CREATE POLICY "Tenant chat messages access" ON public.chat_messages FOR ALL
-USING (auth.role() = 'service_role' OR (auth.role() = 'authenticated' AND (public.requesting_app_role() = 'admin' OR couple_id = public.requesting_couple_id())))
-WITH CHECK (auth.role() = 'service_role' OR (auth.role() = 'authenticated' AND (public.requesting_app_role() = 'admin' OR couple_id = public.requesting_couple_id())));
+DROP POLICY IF EXISTS "Tenant chat messages access" ON public.chat_messages;
+DROP POLICY IF EXISTS "Chat messages participants access" ON public.chat_messages;
+DROP POLICY IF EXISTS "Chat messages select" ON public.chat_messages;
+DROP POLICY IF EXISTS "Chat messages insert" ON public.chat_messages;
+DROP POLICY IF EXISTS "Chat messages update" ON public.chat_messages;
+DROP POLICY IF EXISTS "Chat messages delete" ON public.chat_messages;
+-- 1:1 messages are private to sender and receiver (not the sender's couple, not app admins).
+-- chat_messages: one policy per command. 1:1 rows are private to the sender and receiver, matched on permanent participant ids (jwt app_metadata.pid), never usernames; legacy 1:1 rows without ids are visible to nobody but the service role; the receiver can read but never change or delete.
+-- Non-1:1 = unaddressed legacy, global/global, group_/group_. Mixed or malformed routing counts as 1:1 (private).
+-- Chat rows are written and global/group rows are read ONLY through the server proxy (service role), which enforces
+-- sender binding, routing, membership and the global-lounge switch. Direct database access with a user token can
+-- read only 1:1 rows where the caller is a participant (by permanent id), and cannot write chat rows at all.
+CREATE POLICY "Chat messages select" ON public.chat_messages FOR SELECT
+USING (
+  auth.role() = 'service_role'
+  OR (auth.role() = 'authenticated'
+    AND COALESCE(auth.jwt()->'app_metadata'->>'pid', '') <> ''
+    AND (sender_id = COALESCE(auth.jwt()->'app_metadata'->>'pid', '') OR receiver_id = COALESCE(auth.jwt()->'app_metadata'->>'pid', ''))
+    AND COALESCE(receiver, '') <> 'global' AND COALESCE(conversation_id, '') <> 'global'
+    AND COALESCE(receiver, '') NOT LIKE 'group\_%' AND COALESCE(conversation_id, '') NOT LIKE 'group\_%')
+);
+CREATE POLICY "Chat messages insert" ON public.chat_messages FOR INSERT WITH CHECK (auth.role() = 'service_role');
+CREATE POLICY "Chat messages update" ON public.chat_messages FOR UPDATE USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
+CREATE POLICY "Chat messages delete" ON public.chat_messages FOR DELETE USING (auth.role() = 'service_role');
 

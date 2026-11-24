@@ -1,8 +1,11 @@
+import crypto from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
 import { createServerSession, createTemporaryAuthPassword, hashPasswordScrypt, isSessionSecretConfigured, needsRehash, verifyPassword } from "./auth.js";
 import { consumeBackupCode, verifyTotp } from "./totp.js";
 import { mintFirebaseToken } from "./firebaseToken.js";
-import { authorizeProxy, stripColumns, type Authorized, type Denied } from "./policy.js";
+import { makePid, resolveUsernamePid, pidAccountId, userPid, adminPid, newNonce } from "./participant.js";
+import { sessionMatchesIdentity } from "./participant.js";
+import { authorizeProxy, stripColumns, isGlobalChatRow, visibleChatRow, isDirectChatRow, chatVisibilityOr, type Authorized, type Denied } from "./policy.js";
 import { clearFailures, isBlocked, recordFailure } from "./ratelimit.js";
 import { requireRole, sessionFromRequest } from "./guards.js";
 
@@ -65,6 +68,27 @@ export function redactAdminRow(row: any): any {
   return out;
 }
 
+/** Lazily gives an existing admin account (saved before nonces existed) its server-generated nonce. Best effort: on failure the admin has no
+ *  private-chat id (empty pid) rather than a weaker one. Returns the pid, or "". */
+async function mintAdminNonce(id: string): Promise<string> {
+  try {
+    if (!id || !supabaseAdmin) return "";
+    const { data: row } = await supabaseAdmin.from("admin_settings").select("*").eq("id", "adminAccounts").maybeSingle();
+    if (!row) return "";
+    const accounts = readAdminAccounts(row);
+    const idx = accounts.findIndex((a: any) => String(a.id) === id);
+    if (idx < 0) return "";
+    if (!accounts[idx].pidNonce) {
+      accounts[idx] = { ...accounts[idx], pidNonce: newNonce() };
+      const { error } = await supabaseAdmin.from("admin_settings").update(adminAccountsPatch(row, accounts)).eq("id", "adminAccounts");
+      if (error) return "";
+      const { data: again } = await supabaseAdmin.from("admin_settings").select("*").eq("id", "adminAccounts").maybeSingle();
+      return adminPid(readAdminAccounts(again).find((a: any) => String(a.id) === id));
+    }
+    return adminPid(accounts[idx]);
+  } catch { return ""; }
+}
+
 /** Merge a browser-supplied admin accounts list with what is stored: keep stored hashes/2FA, hash new plaintext. */
 export function mergeAdminAccounts(existing: any[], incoming: any[]): { accounts: any[]; error?: string } {
   const byId = new Map(existing.map((a) => [a.id, a]));
@@ -72,7 +96,8 @@ export function mergeAdminAccounts(existing: any[], incoming: any[]): { accounts
   for (const a of incoming) {
     if (!a || typeof a !== "object" || typeof a.id !== "string" || typeof a.username !== "string" || !a.username.trim()) return { accounts: [], error: "Invalid admin account" };
     const prev = byId.get(a.id);
-    const next: any = omit(a, ["hasPassword", ...TWO_FACTOR_KEYS]);
+    const next: any = omit(a, ["hasPassword", "pidNonce", ...TWO_FACTOR_KEYS]);
+    next.pidNonce = prev?.pidNonce || newNonce(); // server-generated, never taken from the browser
     if (typeof a.password === "string" && a.password) next.password = toStoredPassword(a.password);
     else if (prev?.password) next.password = prev.password;
     else return { accounts: [], error: `Admin account "${a.username}" needs a password` };
@@ -143,6 +168,15 @@ export async function adminSettingsPost(req: any, res: any) {
   }
 }
 
+/** Live lookup of the account's global-lounge switch (default open). Only user accounts have one; a failed lookup fails closed. */
+async function globalLoungeOpen(session: any): Promise<boolean> {
+  const pid: string = session?.pid || "";
+  if (!pid.startsWith("u:")) return true;
+  const { data, error } = await supabaseAdmin!.from("user_accounts").select("*").eq("id", pidAccountId(pid)).maybeSingle();
+  if (error || !data || userPid(data) !== pid) return false; // stale session (account recreated): nothing is open for it
+  return data.enable_global_chat !== false;
+}
+
 export async function proxy(req: any, res: any) {
   const session = sessionFromRequest(req);
   if (!session) return res.status(401).json({ success: false, error: "Authentication required" });
@@ -168,26 +202,47 @@ export async function proxy(req: any, res: any) {
     if (auth.action === "select") {
       let q: any = query.select(auth.select, auth.count ? { count: auth.count, head: auth.head } : undefined);
       q = applyFilters(q);
+      // DB-level visibility so limit/count/single/pagination all see the same rows (the post-filter below is a second layer).
+      const loungeOpen = auth.chatViewer !== undefined ? await globalLoungeOpen(session) : true;
+      if (auth.chatViewer !== undefined) q = q.or(chatVisibilityOr(auth.chatViewer, loungeOpen));
       if (auth.notIn?.length) q = q.not("id", "in", `(${auth.notIn.join(",")})`);
       if (auth.order) q = q.order(auth.order.column, { ascending: auth.order.ascending });
       if (auth.limit) q = q.limit(auth.limit);
       if (auth.single) q = q.single();
       const result = await q;
       let out = result.error ? null : stripColumns(result.data, auth.stripColumns);
+      if (out && auth.chatViewer !== undefined) {
+        // Direct messages are private to their two participants even inside a couple.
+        out = Array.isArray(out) ? out.filter((r: any) => visibleChatRow(r, auth.chatViewer!, loungeOpen)) : (visibleChatRow(out, auth.chatViewer, loungeOpen) ? out : null);
+        if (Array.isArray(out) && auth.count && !auth.head) result.count = out.length;
+        if (out && auth.chatStripCols?.length) {
+          const strip = (r: any) => { const c = { ...r }; for (const k of auth.chatStripCols!) delete c[k]; return c; };
+          out = Array.isArray(out) ? out.map(strip) : strip(out);
+        }
+      }
       if (out && auth.table === "admin_settings") out = Array.isArray(out) ? out.map(redactAdminRow) : redactAdminRow(out);
       return res.json({ success: !result.error, data: out, error: result.error?.message, count: result.count });
     }
 
     if (auth.action === "insert" || auth.action === "upsert") {
       const rows: any[] = Array.isArray(auth.data) ? auth.data : [auth.data];
+      if (auth.table === "chat_messages" && session.role !== "admin" && rows.some((r: any) => isGlobalChatRow(r)) && !(await globalLoungeOpen(session))) {
+        return res.status(403).json({ success: false, error: "The global lounge is closed for this account" });
+      }
 
       // A non-admin must never overwrite a row that belongs to another couple.
       if (auth.ownershipCheckIds.length) {
         const key = auth.onConflict || "id";
         if (key === "id") {
-          const { data: existing, error } = await supabaseAdmin.from(auth.table).select("id,couple_id").in("id", auth.ownershipCheckIds);
+          const { data: existing, error } = await supabaseAdmin.from(auth.table).select(auth.table === "chat_messages" ? "id,couple_id,sender,receiver,conversation_id,sender_id,receiver_id" : "id,couple_id").in("id", auth.ownershipCheckIds);
           if (error) return res.status(500).json({ success: false, error: "Ownership check failed" });
-          if ((existing || []).some((r: any) => r.couple_id && r.couple_id !== session.coupleId)) {
+          if (session.role !== "admin" && (existing || []).some((r: any) => r.couple_id && r.couple_id !== session.coupleId)) {
+            return res.status(403).json({ success: false, error: "Record belongs to another account" });
+          }
+          if (auth.chatDirectGuard && (existing || []).some((r: any) => isDirectChatRow(r) && !visibleChatRow(r, session.pid || ""))) {
+            return res.status(403).json({ success: false, error: "Record belongs to another account" });
+          }
+          if (auth.chatSenderCheck && (existing || []).some((r: any) => r.sender_id !== auth.chatSenderCheck)) {
             return res.status(403).json({ success: false, error: "Record belongs to another account" });
           }
         }
@@ -207,16 +262,23 @@ export async function proxy(req: any, res: any) {
       }
       let lastError = "";
       for (let attempt = 0; attempt < 6; attempt++) {
-        let q: any = query[auth.action](payload, auth.action === "upsert" && auth.onConflict ? { onConflict: auth.onConflict } : undefined);
+        // Admin chat upserts never overwrite an existing row (ON CONFLICT DO NOTHING is atomic; no check-then-write window).
+        const opts = auth.table === "chat_messages" && auth.chatDirectGuard && auth.action === "upsert" ? { onConflict: "id", ignoreDuplicates: true } : auth.action === "upsert" && auth.onConflict ? { onConflict: auth.onConflict } : undefined;
+        let q: any = query[auth.action](payload, opts);
         q = q.select();
         const result = await q;
-        if (!result.error) return res.json({ success: true, data: stripColumns(result.data, auth.stripColumns) });
+        if (!result.error) {
+          let written: any = stripColumns(result.data, auth.stripColumns);
+          // Never echo back a 1:1 message the caller is not part of (an upsert returns the merged row).
+          if (auth.chatReturnViewer !== undefined && Array.isArray(written)) written = written.filter((r: any) => visibleChatRow(r, auth.chatReturnViewer!));
+          return res.json({ success: true, data: written });
+        }
         lastError = result.error.message || String(result.error);
 
         // Tolerate columns missing from an older schema, but never drop the tenant column.
         const col = lastError.match(/Could not find the '([^']+)' column/i)?.[1];
         const target = Array.isArray(payload) ? payload[0] : payload;
-        if (col && col !== "couple_id" && col !== "id" && target && col in target) {
+        if (col && !["couple_id", "id", "pid_nonce", "enable_global_chat", "sender_id", "receiver_id", "author_id"].includes(col) && target && col in target) {
           for (const r of Array.isArray(payload) ? payload : [payload]) delete r[col];
           continue;
         }
@@ -225,18 +287,30 @@ export async function proxy(req: any, res: any) {
       return res.json({ success: false, error: lastError });
     }
 
+    if (auth.chatDirectGuard && (auth.action === "update" || auth.action === "delete")) {
+      // An admin may moderate global/group messages but never touch someone else's 1:1 message.
+      const { data: targets, error: tErr } = await applyFilters(supabaseAdmin.from("chat_messages").select("id,sender,receiver,conversation_id,sender_id,receiver_id"));
+      if (tErr) return res.status(500).json({ success: false, error: "Ownership check failed" });
+      if ((targets || []).some((r: any) => isDirectChatRow(r) && !visibleChatRow(r, session.pid || ""))) {
+        return res.status(403).json({ success: false, error: "Record belongs to another account" });
+      }
+    }
+
+    // Atomic second layer for admin chat writes: the database itself only touches rows the admin may see (non-1:1 rows or their own).
+    const adminChatScope = (q: any) => (auth.chatDirectGuard ? q.or(chatVisibilityOr(session.pid || "")) : q);
+
     if (auth.action === "update") {
       const upd: any = { ...auth.data };
       if (auth.table === "user_accounts" && !auth.selfProfile) {
         if (typeof upd.password === "string" && upd.password) upd.password = toStoredPassword(upd.password);
         else delete upd.password;
       }
-      const result = await applyFilters(query.update(upd));
+      const result = await adminChatScope(applyFilters(query.update(upd)));
       return res.json({ success: !result.error, error: result.error?.message });
     }
 
     // delete
-    const result = await applyFilters(query.delete());
+    const result = await adminChatScope(applyFilters(query.delete()));
     return res.json({ success: !result.error, error: result.error?.message });
   } catch (err: any) {
     console.error("Supabase proxy execution error:", err?.message);
@@ -291,6 +365,8 @@ export async function verifyLogin(req: any, res: any) {
     let isAuthorized = false;
     let authenticatedUsername = username.trim();
     let authenticatedAccountId = "";
+    let authenticatedPid = "";
+    let authenticatedGlobalChat = true;
     let authenticatedCoupleId = "couple_default";
     let authenticatedRole: "admin" | "partner" | "guest" | "user" = "user";
     let upgradeUserId: string | null = null;
@@ -303,6 +379,7 @@ export async function verifyLogin(req: any, res: any) {
       isAuthorized = true;
       authenticatedUsername = matchingAdmin.username;
       authenticatedAccountId = String(matchingAdmin.id || "");
+      authenticatedPid = adminPid(matchingAdmin) || (await mintAdminNonce(String(matchingAdmin.id || "")));
       authenticatedCoupleId = matchingAdmin.coupleId || matchingAdmin.couple_id || "couple_default";
       authenticatedRole = "admin";
       if (matchingAdmin.twoFactorEnabled && matchingAdmin.twoFactorSecret) {
@@ -325,6 +402,7 @@ export async function verifyLogin(req: any, res: any) {
       isAuthorized = true;
       authenticatedUsername = legacyCreds.username;
       authenticatedAccountId = String(legacyCreds.id || "");
+      authenticatedPid = makePid("leg", legacyCreds.id);
       authenticatedCoupleId = legacyCreds.coupleId || legacyCreds.couple_id || "couple_default";
       authenticatedRole = "admin";
       if (pick(legacyCreds, "twoFactorEnabled", "two_factor_enabled") && pick(legacyCreds, "twoFactorSecret", "two_factor_secret")) {
@@ -354,6 +432,8 @@ export async function verifyLogin(req: any, res: any) {
         isAuthorized = true;
         authenticatedUsername = dbUser.username;
         authenticatedAccountId = String(dbUser.id || "");
+        authenticatedPid = userPid(dbUser);
+        authenticatedGlobalChat = (dbUser.enable_global_chat ?? dbUser.enableGlobalChat) !== false;
         authenticatedCoupleId = dbUser.couple_id || dbUser.coupleId || "couple_default";
         authenticatedRole = dbUser.role === "admin" ? "admin" : dbUser.role === "guest" ? "guest" : "partner";
         if (needsRehash(dbUser.password)) upgradeUserId = dbUser.id;
@@ -414,27 +494,33 @@ export async function verifyLogin(req: any, res: any) {
       }
     }
 
-    const serverSession = createServerSession({ username: authenticatedUsername, coupleId: authenticatedCoupleId, role: authenticatedRole });
+    const serverSession = createServerSession({ username: authenticatedUsername, coupleId: authenticatedCoupleId, role: authenticatedRole, pid: authenticatedPid });
 
     let supabaseSession: any = null;
     try {
-      const authEmail = `${cleanUser}@ourhome.local`;
+      // One Supabase auth user PER ACCOUNT (keyed by the permanent id), never per username: two accounts that share a username must not
+      // share a login whose app_metadata (pid, role, couple) the other overwrites. Accounts without a pid keep the old username key but carry pid "".
+      const authEmail = authenticatedPid ? `pid-${crypto.createHash("sha256").update(authenticatedPid).digest("hex").slice(0, 40)}@ourhome.local` : `${cleanUser}@ourhome.local`;
       const temporaryPassword = createTemporaryAuthPassword();
-      const metadata = { app_metadata: { couple_id: authenticatedCoupleId, role: authenticatedRole, username: authenticatedUsername } };
+      const metadata = { app_metadata: { couple_id: authenticatedCoupleId, role: authenticatedRole, username: authenticatedUsername, pid: authenticatedPid, global_chat: authenticatedGlobalChat ? "true" : "false" } };
       const { data: existingUsers } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
       const existingUser = existingUsers?.users?.find((user: any) => user.email === authEmail);
-      if (existingUser) {
-        await supabaseAdmin.auth.admin.updateUserById(existingUser.id, { password: temporaryPassword, ...metadata, email_confirm: true });
-      } else {
-        await supabaseAdmin.auth.admin.createUser({ email: authEmail, password: temporaryPassword, email_confirm: true, ...metadata });
-      }
+      const written = existingUser
+        ? await supabaseAdmin.auth.admin.updateUserById(existingUser.id, { password: temporaryPassword, ...metadata, email_confirm: true })
+        : await supabaseAdmin.auth.admin.createUser({ email: authEmail, password: temporaryPassword, email_confirm: true, ...metadata });
+      if (written?.error) throw new Error("auth user write failed");
       const authResult = await supabaseAdmin.auth.signInWithPassword({ email: authEmail, password: temporaryPassword });
       supabaseSession = authResult.data.session;
+      // Fail closed: never hand out a session whose JWT does not name the account that just logged in (stale/raced metadata).
+      if (supabaseSession && !sessionMatchesIdentity(supabaseSession.access_token, { pid: authenticatedPid, coupleId: authenticatedCoupleId, role: authenticatedRole })) {
+        console.warn("Supabase session dropped: identity mismatch");
+        supabaseSession = null;
+      }
     } catch (e: any) {
       console.warn("Supabase auth session unavailable:", e?.message);
     }
 
-    return res.json({ success: true, username: authenticatedUsername, sessionToken: serverSession, supabaseSession, role: authenticatedRole, coupleId: authenticatedCoupleId, firebaseToken: mintFirebaseToken({ username: authenticatedUsername, coupleId: authenticatedCoupleId, role: authenticatedRole, accountId: authenticatedAccountId }) });
+    return res.json({ success: true, username: authenticatedUsername, sessionToken: serverSession, supabaseSession, role: authenticatedRole, coupleId: authenticatedCoupleId, pid: authenticatedPid, firebaseToken: mintFirebaseToken({ username: authenticatedUsername, coupleId: authenticatedCoupleId, role: authenticatedRole, accountId: authenticatedAccountId, pid: authenticatedPid, globalChat: authenticatedGlobalChat }) });
   } catch (err: any) {
     console.error("Server login verification error:", err?.message);
     return res.status(500).json({ success: false, error: "Authentication error" });
@@ -600,4 +686,58 @@ export async function twoFactor(req: any, res: any) {
     console.error("two-factor failed:", err?.message);
     return res.status(500).json({ success: false, error: "Server error" });
   }
+}
+
+/** POST /api/chat/resolve-participant { usernames: string[] } -> { participants: { [username]: { pid } | { error } } }
+ *  Resolves a username to a permanent participant id at send time. Ambiguous or id-less names never resolve. */
+export async function resolveParticipant(req: any, res: any) {
+  const session = requireRole(req, res, ["admin", "partner", "user"]);
+  if (!session) return;
+  if (!supabaseAdmin) return res.status(503).json({ success: false, error: "Database service unavailable" });
+  const raw = req.body?.usernames;
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 10 || raw.some((u: unknown) => typeof u !== "string" || !u.trim() || u.length > 128)) {
+    return res.status(400).json({ success: false, error: "Invalid usernames" });
+  }
+  const names = Array.from(new Set(raw.map((u: string) => u.trim()))) as string[];
+  const [adminRes, ...userRes] = await Promise.all([
+    supabaseAdmin.from("admin_settings").select("*").in("id", ["adminAccounts", "credentials"]),
+    ...names.map((n) => supabaseAdmin!.from("user_accounts").select("id,username,pid_nonce").ilike("username", escapeLike(n.toLowerCase()))),
+  ]);
+  if (adminRes.error || userRes.some((r: any) => r.error)) return res.status(500).json({ success: false, error: "Lookup failed" });
+  const adminRows = adminRes.data || [];
+  const adminAccounts = readAdminAccounts(adminRows.find((s: any) => s.id === "adminAccounts"));
+  const legacy = adminRows.find((s: any) => s.id === "credentials");
+  const participants: Record<string, any> = {};
+  names.forEach((n, i) => {
+    const r = resolveUsernamePid(n, { userRows: (userRes[i] as any).data || [], adminAccounts, legacy });
+    participants[n] = r.ok === true ? { pid: r.pid } : { error: r.reason };
+  });
+  return res.json({ success: true, participants });
+}
+
+
+/** POST /api/auth/refresh-firebase-token: re-mints the Firestore token from the CURRENT account row, so a change of the global-lounge
+ *  switch takes effect (read and send) without signing in again. Same identity, same claims, nothing else changes. */
+export async function refreshFirebaseToken(req: any, res: any) {
+  const session = requireRole(req, res, ["admin", "partner", "user"]);
+  if (!session) return;
+  if (!supabaseAdmin) return res.status(503).json({ success: false, error: "Database service unavailable" });
+  const pid = session.pid || "";
+  if (!pid) return res.status(409).json({ success: false, error: "Sign in again" });
+  const accountId = pidAccountId(pid);
+  let globalChat = true;
+  if (pid.startsWith("u:")) {
+    const { data, error } = await supabaseAdmin.from("user_accounts").select("*").eq("id", accountId).maybeSingle();
+    if (error || !data || userPid(data) !== pid) return res.status(409).json({ success: false, error: "Account not found; sign in again" });
+    globalChat = data.enable_global_chat !== false;
+  }
+  // Best effort: carry the switch into the Supabase JWT too (new access tokens pick it up on their next refresh).
+  try {
+    const authEmail = `pid-${crypto.createHash("sha256").update(pid).digest("hex").slice(0, 40)}@ourhome.local`;
+    const { data: list } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
+    const au = list?.users?.find((u: any) => u.email === authEmail);
+    if (au) await supabaseAdmin.auth.admin.updateUserById(au.id, { app_metadata: { ...(au.app_metadata || {}), global_chat: globalChat ? "true" : "false" } });
+  } catch { /* the proxy still enforces the switch live */ }
+  const firebaseToken = mintFirebaseToken({ username: session.username, coupleId: session.coupleId, role: session.role, accountId, pid, globalChat });
+  return res.json({ success: true, firebaseToken, globalChat });
 }

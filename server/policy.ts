@@ -1,3 +1,4 @@
+import { isPid } from "./participant.js";
 import type { ServerSessionPayload } from "./auth.js";
 
 /** Tables holding per-couple data. Rows carry couple_id and are scoped to the session's couple. */
@@ -55,10 +56,68 @@ export type Authorized = {
   ownershipCheckIds: string[];
   /** Column names to strip from returned rows. */
   stripColumns: string[];
+  /** Set for non-admin chat_messages reads: only rows this username may see are returned (see visibleChatRow). */
+  chatViewer?: string;
+  /** Set for non-admin chat_messages upserts: existing rows must have been sent by this username. */
+  chatSenderCheck?: string;
+  /** Set for admin chat_messages writes: existing rows that are 1:1 messages of other people block the write. */
+  chatDirectGuard?: boolean;
+  /** Username whose visibility applies to rows returned by writes (insert/upsert). */
+  chatReturnViewer?: string;
+  /** Routing columns added to a sparse chat_messages projection for the visibility check; removed from the response. */
+  chatStripCols?: string[];
 };
 export type Denied = { ok: false; status: number; error: string };
 
 const deny = (status: number, error: string): Denied => ({ ok: false, status, error });
+
+const norm = (v: unknown) => (typeof v === "string" ? v.toLowerCase().trim() : "");
+
+/** True only for rows that are CLEARLY not 1:1: unaddressed legacy (no receiver, no conversation), global (receiver and conversation both
+ *  global) or group (both group_). Anything else, including mixed or malformed routing fields, is treated as a private 1:1 message. */
+export function isNonDirectChatRow(row: any): boolean {
+  // Exact, case-sensitive and untrimmed on purpose: this must agree with the Firestore rules, and any variant ("GLOBAL", " global") is private.
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const receiver = str(row?.receiver);
+  const conv = str(row?.conversation_id ?? row?.conversationId);
+  if (!receiver && !conv) return true;
+  if (receiver === "global" && conv === "global") return true;
+  if (receiver.startsWith("group_") && conv.startsWith("group_")) return true;
+  return false;
+}
+export function isGlobalChatRow(row: any): boolean {
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  return str(row?.receiver) === "global" && str(row?.conversation_id ?? row?.conversationId) === "global";
+}
+export const isDirectChatRow = (row: any): boolean => !isNonDirectChatRow(row);
+
+/** Whether the signed-in account (admins included) may see a chat_messages row. 1:1 rows are visible ONLY to the accounts whose permanent
+ *  participant id is the row's sender_id or receiver_id. There is no username fallback: legacy 1:1 rows without ids are visible to nobody
+ *  here until an operator-reviewed backfill assigns ids. Sparse rows (missing routing/id columns) fail closed. */
+export function visibleChatRow(row: any, pid: string, globalOpen = true): boolean {
+  if (!row || typeof row !== "object") return false;
+  for (const k of ["receiver", "sender_id", "receiver_id"]) if (!(k in row)) return false;
+  if (!("conversation_id" in row) && !("conversationId" in row)) return false;
+  if (!isDirectChatRow(row)) return globalOpen || !isGlobalChatRow(row); // clearly non-1:1 rows keep the couple scope; a closed lounge hides global rows
+  return !!pid && (row.sender_id === pid || row.receiver_id === pid);
+}
+
+/** PostgREST or() expression: rows this account may see (participant by id, or not a 1:1 message). Values are double-quoted and escaped. */
+export function chatVisibilityOr(pid: string, globalOpen = true): string {
+  const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const group = q("group\\_%");
+  const parts = [
+    `and(receiver.is.null,conversation_id.is.null)`,
+    ...(globalOpen ? [`and(receiver.eq.global,conversation_id.eq.global)`] : []),
+    `and(receiver.like.${group},conversation_id.like.${group})`,
+  ];
+  if (pid) parts.unshift(`sender_id.eq.${q(pid)}`, `receiver_id.eq.${q(pid)}`);
+  return parts.join(",");
+}
+
+function escapeLikeValue(s: string) {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
 
 export function isCoupleTable(t: string) {
   return (COUPLE_TABLES as readonly string[]).includes(t);
@@ -112,11 +171,33 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
   }
   if (!isAdmin && table === "profiles" && action === "select") scopedFilters = [...filters, { column: "username", operator: "eq", value: session.username }];
 
+  // Chat messages: direct (1:1) messages belong to their two participants, not to the sender's couple and not to app admins.
+  let chatViewer: string | undefined;
+  let chatSenderCheck: string | undefined;
+  let chatDirectGuard = false;
+  if (table === "chat_messages") {
+    const myPid = session.pid || "";
+    if (action === "select") chatViewer = myPid; // "" is allowed: such a session sees only non-1:1 rows
+    if (!isAdmin && (action === "update" || action === "delete")) {
+      // Only the sender (matched on the permanent id bound into the session) may edit or delete their own message.
+      if (!myPid) return deny(403, "Sign in again to use chat");
+      scopedFilters = [...scopedFilters, { column: "sender_id", operator: "eq", value: myPid }];
+    }
+    if (isAdmin && action !== "select") chatDirectGuard = true; // admin writes may not touch or reveal someone else's 1:1 message
+  }
+
   // Select shape.
   let select = "*";
   if (body.select !== undefined) {
     if (typeof body.select !== "string" || body.select.length > 500 || !SELECT_LIST.test(body.select)) return deny(400, "Invalid select");
     select = body.select || "*";
+  }
+  // chat_messages: visibility checks need the routing columns, so sparse projections always fetch them (and strip them again for the caller).
+  let chatStripCols: string[] | undefined;
+  if (table === "chat_messages" && action === "select" && select.trim() !== "*") {
+    const have = select.split(",").map((t) => t.trim().toLowerCase());
+    const missing = ["sender_id", "receiver_id", "receiver", "conversation_id"].filter((c) => !have.includes(c));
+    if (missing.length) { select = `${select},${missing.join(",")}`; chatStripCols = missing; }
   }
   let order: Authorized["order"];
   if (body.order !== undefined) {
@@ -164,6 +245,31 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
       if (!r || typeof r !== "object" || Array.isArray(r)) return deny(400, "Invalid payload");
       for (const k of Object.keys(r)) if (!IDENT.test(k)) return deny(400, "Invalid column name");
     }
+    if (table === "chat_messages" && action !== "update" && !session.pid) return deny(403, "Sign in again to use chat");
+    if (!isAdmin && table === "chat_messages") {
+      for (const r of rows) {
+        if (action === "update") {
+          // Routing and authorship never change on update.
+          for (const k of ["sender", "receiver", "conversation_id", "conversationId", "sender_id", "receiver_id"]) delete r[k];
+        } else {
+          if (norm(r.sender) !== norm(session.username)) return deny(403, "You can only send messages as yourself");
+          r.sender_id = session.pid; // server-stamped authorship, never client-supplied
+          if (isDirectChatRow(r)) {
+            if (!isPid(r.receiver_id)) return deny(400, "Direct messages need a resolved recipient");
+          } else {
+            r.receiver_id = null;
+          }
+        }
+      }
+      if (action === "upsert") chatSenderCheck = session.pid;
+    }
+    if (isAdmin && table === "chat_messages" && action !== "update") {
+      // An admin can only author direct messages as themselves.
+      for (const r of rows) if (isDirectChatRow(r)) return deny(403, "Direct messages are written by their sender in the app, not through the admin proxy");
+    }
+    if (isAdmin && table === "chat_messages" && action === "upsert") {
+      for (const r of rows) if (typeof r.id === "string") ownershipCheckIds.push(r.id);
+    }
     if (!isAdmin) {
       // Stamp tenant on every row; never trust a client-supplied couple_id.
       for (const r of rows) {
@@ -177,6 +283,7 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
       const oc = body.options?.onConflict;
       if (oc !== undefined) {
         if (oc !== "id" && oc !== "couple_id") return deny(400, "Invalid onConflict");
+        if (table === "chat_messages" && oc !== "id") return deny(400, "Invalid onConflict");
         onConflict = oc;
       }
     }
@@ -191,7 +298,7 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
 
   // Admin writes to user_accounts cannot set 2FA material; that goes through the re-authenticating endpoint.
   if (isAdmin && write && table === "user_accounts" && data && typeof data === "object") {
-    for (const r of Array.isArray(data) ? data : [data]) for (const k of ["two_factor_secret", "two_factor_backup_codes", "two_factor_enabled", "two_factor_created_at"]) delete r[k];
+    for (const r of Array.isArray(data) ? data : [data]) for (const k of ["two_factor_secret", "two_factor_backup_codes", "two_factor_enabled", "two_factor_created_at", "pid_nonce", "pidNonce"]) delete r[k];
   }
 
   // Non-admins never see the rows that hold admin credentials.
@@ -216,6 +323,11 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
     head: !!body.head,
     ownershipCheckIds,
     stripColumns,
+    chatViewer,
+    chatSenderCheck,
+    chatDirectGuard,
+    chatReturnViewer: table === "chat_messages" ? (session.pid || "") : undefined,
+    chatStripCols,
   };
 }
 

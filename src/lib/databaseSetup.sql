@@ -255,7 +255,8 @@ CREATE TABLE IF NOT EXISTS public.chat_messages (
 );
 ALTER TABLE public.chat_messages ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Chat messages access policy" ON public.chat_messages;
-CREATE POLICY "Chat messages access policy" ON public.chat_messages FOR ALL USING (true) WITH CHECK (true);
+-- Chat rows: service role only (the server proxy). Use supabase_schema.sql / the fresh-init script for the final participant policies.
+CREATE POLICY "Chat messages access policy" ON public.chat_messages FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 ALTER TABLE public.chat_messages ADD COLUMN IF NOT EXISTS couple_id TEXT DEFAULT 'couple_default';
 
 -- 14. Celebration Cards (Choose Card) Table
@@ -382,9 +383,7 @@ USING (auth.role() = 'service_role' OR (auth.role() = 'authenticated' AND (publi
 WITH CHECK (auth.role() = 'service_role' OR (auth.role() = 'authenticated' AND (public.requesting_app_role() = 'admin' OR couple_id = public.requesting_couple_id())));
 
 DROP POLICY IF EXISTS "Chat messages access policy" ON public.chat_messages;
-CREATE POLICY "Tenant chat messages access" ON public.chat_messages FOR ALL
-USING (auth.role() = 'service_role' OR (auth.role() = 'authenticated' AND (public.requesting_app_role() = 'admin' OR couple_id = public.requesting_couple_id())))
-WITH CHECK (auth.role() = 'service_role' OR (auth.role() = 'authenticated' AND (public.requesting_app_role() = 'admin' OR couple_id = public.requesting_couple_id())));
+CREATE POLICY "Tenant chat messages access" ON public.chat_messages FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
 DROP POLICY IF EXISTS "Celebration cards access policy" ON public.celebration_cards;
 DROP POLICY IF EXISTS "Celebration cards couple isolation" ON public.celebration_cards;
