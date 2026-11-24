@@ -1291,7 +1291,7 @@ export async function saveAdminSettingDoc(setting: AdminSetting) {
   if (isCredentialSetting(setting)) {
     if (!isSupabaseConfigured) throw new Error("Credential changes require the server database.");
     await saveCredentialSetting(mapToDb(setting), {
-      fetch, token: localStorage.getItem("love_server_session_token") || "",
+      fetch: (input, init) => window.fetch(input, init), token: localStorage.getItem("love_server_session_token") || "",
       commit: (rows) => {
         const safe = rows.map((row) => mapFromDb<AdminSetting>(row));
         cachedSupabaseAdminSettings = safe;

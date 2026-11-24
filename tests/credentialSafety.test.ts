@@ -53,3 +53,10 @@ test('actual client wiring uses dedicated credential workflow, excludes legacy s
  assert.ok(!account.includes('onSnapshot('));assert.ok(!account.includes('setDoc('));
  const sync=fs.readFileSync('src/lib/syncService.ts','utf8');assert.ok(sync.includes('account bulk sync is disabled'));
 });
+
+test('regression: browser-style fetch that rejects a foreign this (Illegal invocation) still works',async()=>{
+ function browserFetch(this:any){ if(this!==undefined&&this!==globalThis) throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation"); return Promise.resolve({ok:true,json:async()=>({success:true,settings:[]})}); }
+ let committed=false;
+ await saveCredentialSetting({id:'adminAccounts',admin_accounts:[]},{fetch:browserFetch as any,token:'t',commit:()=>{committed=true;}});
+ assert.equal(committed,true);
+});

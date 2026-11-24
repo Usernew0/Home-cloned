@@ -20,10 +20,12 @@ export async function saveCredentialSetting(
   deps: { fetch: typeof fetch; token: string; commit: (rows: any[]) => void }
 ) {
   const headers = { 'Content-Type': 'application/json', ...(deps.token ? {'x-server-session': deps.token} : {}) };
-  const response = await deps.fetch('/api/admin-settings', {method:'POST', headers, body:JSON.stringify(setting)});
+  // Call fetch detached from deps: browsers throw "Illegal invocation" when window.fetch runs with another object as `this`.
+  const doFetch = deps.fetch;
+  const response = await doFetch('/api/admin-settings', {method:'POST', headers, body:JSON.stringify(setting)});
   const result = await response.json();
   if (!response.ok || !result.success) throw new Error(result.error || 'Credential save failed.');
-  const refreshed = await deps.fetch('/api/admin-settings', {headers});
+  const refreshed = await doFetch('/api/admin-settings', {headers});
   const data = await refreshed.json();
   if (!refreshed.ok || !data.success || !Array.isArray(data.settings)) {
     throw new Error('Credentials were saved, but refresh failed. Reload before editing again.');
