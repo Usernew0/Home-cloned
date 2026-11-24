@@ -2509,9 +2509,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
     setIsSyncing(true);
     try {
       // 1. Only accounts that really live in this space are unlinked (never matched by name).
-      const { users: affectedUsers, canUnlink } = unlinkTargets(tenant, userAccounts);
+      const { users: affectedUsers, canUnlink } = unlinkTargets(tenant, userAccounts, accountsLoaded);
       if (!canUnlink) {
-        setUserErrorMsg("No account is linked to this space, so there is nothing to unlink. Nothing was changed or deleted.");
+        setUserErrorMsg(accountsLoaded ? "No account is linked to this space, so there is nothing to unlink. Nothing was changed or deleted." : "Accounts are still loading from the server. Wait a moment and try again. Nothing was changed.");
         setIsSyncing(false);
         return;
       }
@@ -3646,6 +3646,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
                     tenant={tenant}
                     unlinkedSpace={isSpaceUnlinked(tenant, userAccounts, accountsLoaded)}
                     isSyncing={isSyncing}
+                    accountsLoaded={accountsLoaded}
                     subscriptionPlans={subscriptionPlans}
                     getStatus={getSubscriptionStatus}
                     onSetPlan={handleSetTenantPlan}

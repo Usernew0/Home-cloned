@@ -5,7 +5,7 @@ import {renderToStaticMarkup} from 'react-dom/server';
 import {CoupleTenantRow} from '../src/components/CoupleTenantRow.tsx';
 import {isSpaceUnlinked} from '../src/lib/coupleLink.ts';
 
-const mk=(t:any,loaded:boolean,users:any[])=>renderToStaticMarkup(React.createElement(CoupleTenantRow,{tenant:{plan:'pro',created_at:'',isFromDatabase:true,...t} as any,unlinkedSpace:isSpaceUnlinked(t,users,loaded),isSyncing:false,subscriptionPlans:[{id:'pro',name:'Pro',price:'$1'} as any],getStatus:()=>({isExpired:false,isLifetime:true,statusText:'Lifetime',formattedEndDate:'x'}),onSetPlan:()=>{},onUnlink:()=>{},onSaveToDb:()=>{}}));
+const mk=(t:any,loaded:boolean,users:any[])=>renderToStaticMarkup(React.createElement(CoupleTenantRow,{tenant:{plan:'pro',created_at:'',isFromDatabase:true,...t} as any,unlinkedSpace:isSpaceUnlinked(t,users,loaded),isSyncing:false,accountsLoaded:loaded,subscriptionPlans:[{id:'pro',name:'Pro',price:'$1'} as any],getStatus:()=>({isExpired:false,isLifetime:true,statusText:'Lifetime',formattedEndDate:'x'}),onSetPlan:()=>{},onUnlink:()=>{},onSaveToDb:()=>{}}));
 const users=[{id:'1',username:'E',coupleId:'j'}];
 test('production row: label only when loaded and unlinked; Unlink always present; no dimming or deletion wording',()=>{
  const solo={coupleId:'s',coupleName:'solo',partner1:'E',partner2:''};
@@ -14,4 +14,9 @@ test('production row: label only when loaded and unlinked; Unlink always present
  assert.doesNotMatch(mk(solo,true,[]),/No accounts currently linked/);
  const joint={coupleId:'j',coupleName:'joint',partner1:'E',partner2:'Q'};
  const b=mk(joint,true,users); assert.doesNotMatch(b,/No accounts currently linked/); assert.match(b,/Unlink/); assert.doesNotMatch(b,/<button[^>]*disabled=""[^>]*>(?:(?!<\/button>).)*Unlink/s);
+});
+
+test('production row: Unlink disabled while accounts are not loaded, even for a two-partner space',()=>{
+ const joint={coupleId:'j',coupleName:'joint',partner1:'E',partner2:'Q'};
+ assert.match(mk(joint,false,users),/<button[^>]*disabled[^>]*>(?:(?!<\/button>).)*Unlink/s);
 });

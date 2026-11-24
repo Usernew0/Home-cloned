@@ -46,9 +46,15 @@ test('unlinked label needs a server-loaded, non-empty account list',()=>{
 
 test('regression: Unlink never touches an account by name and never acts on a space with no linked accounts',()=>{
  const us=[{id:'1',username:'Ebrahimtest',coupleId:'c_joint'},{id:'2',username:'Qq',coupleId:'c_joint'}];
- const solo=unlinkTargets(tenants[0],us);   // leftover solo row that lists Ebrahimtest as partner1
+ const solo=unlinkTargets(tenants[0],us,true);   // leftover solo row that lists Ebrahimtest as partner1
  assert.equal(solo.canUnlink,false); assert.equal(solo.users.length,0);
- const joint=unlinkTargets(tenants[2],us);
+ const joint=unlinkTargets(tenants[2],us,true);
  assert.equal(joint.canUnlink,true); assert.deepEqual(joint.users.map(u=>u.username),['Ebrahimtest','Qq']);
- assert.equal(unlinkTargets({partner1:'x'} as any,us).canUnlink,false);
+ assert.equal(unlinkTargets({partner1:'x'} as any,us,true).canUnlink,false);
+});
+
+test('regression: Unlink is refused while accounts are cache-only (stale pre-relink list)',()=>{
+ const stale=[{id:'1',username:'Ebrahimtest',coupleId:'c_solo_e'}];
+ const r=unlinkTargets(tenants[0],stale,false);
+ assert.equal(r.canUnlink,false); assert.equal(r.users.length,0);
 });

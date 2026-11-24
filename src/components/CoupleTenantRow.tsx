@@ -7,6 +7,8 @@ type Props = {
   /** True when no loaded account currently points at this space. It says nothing about stored data. */
   unlinkedSpace: boolean;
   isSyncing: boolean;
+  /** Unlink needs the server-loaded account list. */
+  accountsLoaded: boolean;
   subscriptionPlans: SubscriptionPlan[];
   getStatus: (t: any) => { isExpired: boolean; isLifetime: boolean; statusText: string; formattedEndDate: string };
   onSetPlan: (t: CoupleTenant, plan: string) => void;
@@ -14,7 +16,7 @@ type Props = {
   onSaveToDb: (t: CoupleTenant) => void;
 };
 
-export function CoupleTenantRow({ tenant, unlinkedSpace, isSyncing, subscriptionPlans, getStatus, onSetPlan, onUnlink, onSaveToDb }: Props) {
+export function CoupleTenantRow({ tenant, unlinkedSpace, isSyncing, accountsLoaded, subscriptionPlans, getStatus, onSetPlan, onUnlink, onSaveToDb }: Props) {
   return (
                   <div data-unlinked-space={unlinkedSpace ? "true" : undefined} data-testid="tenant-row" className={`p-4 bg-neutral-950/50 border border-white/10 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:border-white/20 transition-all shadow-md`}>
                     <div>
@@ -98,7 +100,7 @@ export function CoupleTenantRow({ tenant, unlinkedSpace, isSyncing, subscription
                         </button>
                       )}
 
-                                            <button type="button" onClick={() => onUnlink(tenant)} disabled={isSyncing || unlinkedSpace} title={unlinkedSpace ? "No account is linked to this space, so there is nothing to unlink. This button does not delete spaces." : "Unlink these partners"} className="text-[11px] text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 px-2.5 py-1 rounded-xl transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50">
+                                            <button type="button" onClick={() => onUnlink(tenant)} disabled={isSyncing || unlinkedSpace || !accountsLoaded} title={unlinkedSpace ? "No account is linked to this space, so there is nothing to unlink. This button does not delete spaces." : "Unlink these partners"} className="text-[11px] text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 px-2.5 py-1 rounded-xl transition-all flex items-center gap-1 cursor-pointer disabled:opacity-50">
                         <Unlink className="w-3 h-3" />
                         <span>Unlink</span>
                       </button>

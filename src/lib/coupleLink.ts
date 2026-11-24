@@ -51,7 +51,9 @@ export function isSpaceUnlinked(tenant: LinkTenant, users: LinkUser[], accountsL
  * Never match by name (a leftover solo row shares a name with an account that lives in another space).
  * No linked accounts means there is nothing to unlink, so the caller must not delete the record either.
  */
-export function unlinkTargets<U extends LinkUser>(tenant: LinkTenant, users: U[]): { users: U[]; canUnlink: boolean } {
+export function unlinkTargets<U extends LinkUser>(tenant: LinkTenant, users: U[], accountsLoaded: boolean): { users: U[]; canUnlink: boolean } {
+  // A cache-only list may predate a relink, so it must never be used to write account changes.
+  if (!accountsLoaded) return { users: [], canUnlink: false };
   const targets = tenant.coupleId ? users.filter((u) => u.coupleId === tenant.coupleId) : [];
   return { users: targets, canUnlink: targets.length > 0 };
 }
