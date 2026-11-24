@@ -899,19 +899,19 @@ export async function deleteCelebrationCardDoc(id: string) {
 
 export const DEFAULT_COUPLE_ACCOUNTS: UserAccount[] = [];
 
-const userAccountListeners: Array<(data: UserAccount[]) => void> = [];
+const userAccountListeners: Array<(data: UserAccount[], fromServer?: boolean) => void> = [];
 
-function notifyUserAccountListeners(accounts: UserAccount[]) {
+function notifyUserAccountListeners(accounts: UserAccount[], fromServer = false) {
   userAccountListeners.forEach((cb) => {
     try {
-      cb(accounts);
+      cb(accounts, fromServer);
     } catch (e) {
       console.warn("Listener error:", e);
     }
   });
 }
 
-export function subscribeToUserAccounts(callback: (data: UserAccount[]) => void) {
+export function subscribeToUserAccounts(callback: (data: UserAccount[], fromServer?: boolean) => void) {
   const initial = storage.getUserAccounts();
   callback(initial);
   userAccountListeners.push(callback);
@@ -927,7 +927,7 @@ export function subscribeToUserAccounts(callback: (data: UserAccount[]) => void)
       if (!error && data) {
         const mapped = data.map((item) => mapFromDb<UserAccount>(item));
         storage.setUserAccounts(mapped);
-        notifyUserAccountListeners(mapped);
+        notifyUserAccountListeners(mapped, true);
       } else if (error) {
         handleSupabaseError("subscribeToUserAccounts", error);
       }

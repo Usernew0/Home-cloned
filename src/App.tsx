@@ -256,7 +256,7 @@ export default function App() {
   const [coupleQuestions, setCoupleQuestions] = useState<CoupleQuestion[]>(() => storage.getCoupleQuestions());
   const [userPresences, setUserPresences] = useState<UserPresence[]>([]);
   const [userAccounts, setUserAccounts] = useState<UserAccount[]>(() => storage.getUserAccounts());
-  // False until the server list has replaced the local cache, so the panel never reports "no accounts linked" from a stale cache.
+  // False until a server fetch (not the local cache or a local save) has delivered the list, so the panel never reports "no accounts linked" from a stale cache.
   const [userAccountsFetched, setUserAccountsFetched] = useState(false);
   const [adminSettings, setAdminSettings] = useState<AdminSetting[]>(() => storage.getAdminSettings());
   const [activityLogs, setActivityLogs] = useState<UserActivityLog[]>([]);
@@ -1065,10 +1065,10 @@ export default function App() {
     }
 
     const timer = setTimeout(() => {
-      let accountCallbacks = 0;
-      unsubUserAccounts = subscribeToUserAccounts((data) => {
+      setUserAccountsFetched(false); // every (re)subscribe starts from the cache again
+      unsubUserAccounts = subscribeToUserAccounts((data, fromServer) => {
         setUserAccounts(data);
-        if (++accountCallbacks > 1) setUserAccountsFetched(true);
+        if (fromServer) setUserAccountsFetched(true);
       });
 
       unsubAdminSettings = subscribeToAdminSettings((data) => {
