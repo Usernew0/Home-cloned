@@ -49,7 +49,7 @@ export async function endFirebaseSession() {
 /** After the lounge switch changes: re-mint the token from the server's current account row so rules start/stop allowing the global room. */
 export async function refreshFirebaseSession() {
   try {
-    const r = await fetch('/api/auth/refresh-firebase-token', { method: 'POST', headers: authHeaders() });
+    const r = await fetch('/api/proxy?op=refresh-token', { method: 'POST', headers: authHeaders() });
     const j = await r.json();
     if (j?.success && j.firebaseToken) await signInWithCustomToken(firebaseAuth, j.firebaseToken);
   } catch { /* the old token keeps working until it expires */ }

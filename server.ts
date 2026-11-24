@@ -7,7 +7,7 @@ import { createServerSession, createTemporaryAuthPassword, verifyPassword, verif
 import { parseAudioUpload } from "./server/audio.js";
 import { generateDate } from "./server/generateDate.js";
 import { rolesForPath, requireRole } from "./server/guards.js";
-import { refreshFirebaseToken, resolveParticipant, adminSettingsGet, adminSettingsPost, changePassword, proxy, stripeCheckoutDisabled, twoFactor, verifyLogin } from "./server/handlers.js";
+import { refreshFirebaseToken, resolveParticipant, adminSettingsGet, adminSettingsPost, changePassword, proxy, proxyEntry, stripeCheckoutDisabled, twoFactor, verifyLogin } from "./server/handlers.js";
 
 const app = express();
 const PORT = 3000;
@@ -43,7 +43,7 @@ async function startServer() {
   app.post("/api/admin-settings", adminSettingsPost);
 
   // Secure Backend Proxy for All Supabase Database Operations
-  app.post("/api/proxy", proxy);
+  app.post("/api/proxy", proxyEntry);
   app.post("/api/chat/resolve-participant", resolveParticipant);
 
   // Secure Server-Side Login Verification Endpoint (Prevents network data exposure before login)

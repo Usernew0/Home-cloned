@@ -177,6 +177,14 @@ async function globalLoungeOpen(session: any): Promise<boolean> {
   return data.enable_global_chat !== false;
 }
 
+/** Single entry for /api/proxy: two small endpoints share it so the deployment stays within the 12-function limit of the Vercel plan. */
+export async function proxyEntry(req: any, res: any) {
+  const op = String(req.query?.op || "");
+  if (op === "refresh-token") return refreshFirebaseToken(req, res);
+  if (op === "resolve-participant") return resolveParticipant(req, res);
+  return proxy(req, res);
+}
+
 export async function proxy(req: any, res: any) {
   const session = sessionFromRequest(req);
   if (!session) return res.status(401).json({ success: false, error: "Authentication required" });

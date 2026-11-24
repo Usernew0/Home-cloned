@@ -305,3 +305,10 @@ test("no shipped SQL file leaves chat_messages open to browser tokens", async ()
     }
   }
 });
+
+test("api/ stays within the 12 serverless functions the hosting plan allows", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const count = (dir: string): number => fs.readdirSync(dir, { withFileTypes: true }).reduce((n, e) => n + (e.isDirectory() ? count(path.join(dir, e.name)) : /\.(ts|js|mjs)$/.test(e.name) ? 1 : 0), 0);
+  assert.ok(count(new URL("../api", import.meta.url).pathname) <= 12);
+});
