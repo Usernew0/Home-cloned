@@ -56,3 +56,34 @@ test('known browser-secret settings block builds, with names but never values', 
     assert.throws(() => publicBuildEnv({ [name]: 'synthetic-secret-not-for-logs' }), (error: Error) => error.message.includes(name) && !error.message.includes('synthetic-secret-not-for-logs'));
   }
 });
+
+test('server clients do not keep a user session (service key stays in force after a sign-in)', async () => {
+  const script = `
+    import assert from 'node:assert/strict';
+    const seen = [];
+    globalThis.fetch = async (url, init) => {
+      const u = String(url); const h = new Headers(init?.headers);
+      seen.push([u.replace(/^https?:\\/\\/[^/]+/, ''), h.get('authorization')]);
+      if (u.includes('/auth/v1/token')) return new Response(JSON.stringify({ access_token: 'user-jwt', refresh_token: 'r', token_type: 'bearer', expires_in: 3600, user: { id: 'u1' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const { supabaseAdmin } = await import('./server/handlers.ts');
+    const { createClient } = await import('@supabase/supabase-js');
+    await supabaseAdmin.from('user_accounts').select('id');
+    await createClient('https://primary.supabase.test', 'service-key-synthetic', { auth: { persistSession: false, autoRefreshToken: false } }).auth.signInWithPassword({ email: 'a@b.c', password: 'x' });
+    await supabaseAdmin.from('user_accounts').select('id');
+    const rest = seen.filter(([p]) => p.startsWith('/rest/v1/'));
+    assert.equal(rest.length, 2);
+    for (const [, auth] of rest) assert.equal(auth, 'Bearer service-key-synthetic');
+  `;
+  const env = { ...process.env, SUPABASE_URL: 'https://primary.supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'service-key-synthetic', SERVER_SESSION_SECRET: 'synthetic-session-secret-at-least-32-chars' };
+  const r = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], { cwd: process.cwd(), env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+});
+
+test('source guard: no password sign-in on the shared server client (it would turn the service client into that user)', async () => {
+  const { readFileSync } = await import('node:fs');
+  for (const f of ['server/handlers.ts', 'server.ts', 'server/supabaseLazy.ts']) {
+    assert.doesNotMatch(readFileSync(f, 'utf8'), /supabaseAdmin\.auth\.signIn|getServiceSupabase\(\)\.auth\.signIn|lazySupabase\.auth\.signIn/, f);
+  }
+});

@@ -19,7 +19,7 @@ const projectRoot = process.cwd();
 import { resolveServerSupabaseKey } from "./server/serverKey.js";
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "";
 const supabaseKey = resolveServerSupabaseKey();
-const supabaseAdmin = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
+const supabaseAdmin = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }) : null;
 
 async function startServer() {
   app.use(express.json({ limit: "15mb" }));

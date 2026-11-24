@@ -12,7 +12,9 @@ import { resolveServerSupabaseKey } from "./serverKey.js";
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "";
 const supabaseKey = resolveServerSupabaseKey();
-export const supabaseAdmin = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
+/** Server clients never keep a user session: a session stored on the shared client would replace the service key on later requests (they would run as that user). */
+const NO_SESSION = { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } } as const;
+export const supabaseAdmin = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey, NO_SESSION) : null;
 
 
 const PRIVILEGED_SETTING_IDS = ["adminAccounts", "credentials"];
@@ -519,7 +521,8 @@ export async function verifyLogin(req: any, res: any) {
         ? await supabaseAdmin.auth.admin.updateUserById(existingUser.id, { password: temporaryPassword, ...metadata, email_confirm: true })
         : await supabaseAdmin.auth.admin.createUser({ email: authEmail, password: temporaryPassword, email_confirm: true, ...metadata });
       if (written?.error) throw new Error("auth user write failed");
-      const authResult = await supabaseAdmin.auth.signInWithPassword({ email: authEmail, password: temporaryPassword });
+      // A throwaway client: signing in on the shared service client would store the user session there and switch every later query to that user.
+      const authResult = await createClient(supabaseUrl, supabaseKey, NO_SESSION).auth.signInWithPassword({ email: authEmail, password: temporaryPassword });
       supabaseSession = authResult.data.session;
       // Fail closed: never hand out a session whose JWT does not name the account that just logged in (stale/raced metadata).
       if (supabaseSession && !sessionMatchesIdentity(supabaseSession.access_token, { pid: authenticatedPid, coupleId: authenticatedCoupleId, role: authenticatedRole })) {

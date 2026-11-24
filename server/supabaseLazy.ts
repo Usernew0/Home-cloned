@@ -9,7 +9,7 @@ export function getServiceSupabase(): SupabaseClient {
     const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
     const key = resolveServerSupabaseKey();
     if (!url || !key) throw new Error("Supabase is not configured");
-    client = createClient(url, key);
+    client = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
   }
   return client;
 }
