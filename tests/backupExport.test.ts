@@ -117,7 +117,7 @@ test("firestore: plan lists collections, page decodes typed values and follows t
 
 test("firestore not configured: plan says so, page refuses", async () => {
   const h = makeBackupHandlers(() => null, {});
-  const p = mockRes(); await h.plan(as("admin"), p); assert.equal(p.body.firestore.available, false); assert.match(p.body.firestore.note, /not configured/);
+  const p = mockRes(); await h.plan(as("admin"), p); assert.equal(p.body.firestore.available, false); assert.match(p.body.firestore.note, /FIREBASE_SERVICE_ACCOUNT_EMAIL and FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY are not both set/);
   const g = mockRes(); await h.page(as("admin", { source: "firestore", collection: "members" }), g); assert.equal(g.code, 503);
 });
 

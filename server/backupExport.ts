@@ -179,8 +179,8 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
     const { host, ref } = refOf(c.sbUrl);
     const out: any = { success: true, target: c.target, targets: [{ id: "app", label: "This app's own connection" }, ...(separateConfigured(env) ? [{ id: "separate", label: "Separately configured backup source" }] : [])], supabase: { available: !!c.db, tables: [...BACKUP_TABLES], ref: ref || null, host: host || null }, firestore: { available: false, project: c.project || null, collections: [] as string[], note: "" } };
     const project = () => c.project; const fsConfigured = () => c.fsOk; const token = c.token;
-    if (!fsConfigured()) out.firestore.note = "Firestore service account is not configured for this source.";
-    else if (!project()) out.firestore.note = "The Firestore project id is not set for this source.";
+    if (!fsConfigured()) out.firestore.note = c.target === "separate" ? "Firestore is off: BACKUP_SOURCE_FIREBASE_SERVICE_ACCOUNT_EMAIL and BACKUP_SOURCE_FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY are not both set on the server." : "Firestore is off: FIREBASE_SERVICE_ACCOUNT_EMAIL and FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY are not both set on the server.";
+    else if (!project()) out.firestore.note = c.target === "separate" ? "Firestore is off: BACKUP_SOURCE_FIREBASE_PROJECT_ID is not set on the server. The service account is set." : "Firestore is off: FIREBASE_PROJECT_ID is not set on the server. The service account is set.";
     else {
       try {
         const r = await fetchImpl(`${fsBase(project())}:listCollectionIds`, { method: "POST", headers: { Authorization: `Bearer ${await token()}`, "Content-Type": "application/json" }, body: JSON.stringify({ pageSize: 300 }) });

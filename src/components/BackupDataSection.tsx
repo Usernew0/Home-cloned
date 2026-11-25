@@ -215,6 +215,7 @@ export const BackupDataSection: React.FC = () => {
 
       <div className="rounded-2xl border border-white/10 bg-neutral-950/60 p-4 flex flex-col gap-2" data-testid="verify-box">
         <div className="text-sm font-semibold text-white flex items-center gap-2"><FileCheck2 className="w-4 h-4" /> Check an encrypted copy (file integrity only)</div>
+        <p className="text-[11px] text-amber-200" data-testid="verify-needs-encrypted">Needs a file made with Encrypted data copy, plus its passphrase. A Readable export cannot be checked or restored: its secrets were removed.</p>
         <p className="text-[11px] text-neutral-400">Opens the file here, recomputes every table hash and shows which project it came from. This proves the file is intact, not that it matches the source or restores cleanly. The restore script is not run by this panel and has been tested only on a synthetic database.</p>
         <input type="file" accept=".json" className="text-xs text-neutral-300" onChange={(e) => { setVFile(e.target.files?.[0] || null); setVResult(null); }} disabled={busy} />
         <input type="password" className={inputCls} placeholder="Passphrase" value={vPass} onChange={(e) => setVPass(e.target.value)} disabled={busy} autoComplete="off" />
