@@ -101,6 +101,41 @@ function scopedCol(name: string) {
   return query(base, where('coupleId', '==', scope.coupleId));
 }
 
+/** Data collections hold two spaces per account in the membership release: the account's PERSONAL space and the current joint space (legacy rows, read-only).
+ *  Without a personal id (earlier sessions, admins) this is the single scoped query it always was. Each space is its own constrained query so the rules can prove it.
+ *  A failing space (for example no membership doc yet) counts as empty; the other space still loads. */
+type ForEachSnap = { forEach: (cb: (d: { id: string; data: () => any }) => void) => void };
+function twoSpaces(): { personal: string; joint: string } | null {
+  const scope = getFirebaseScope();
+  if (!scope || scope.role === 'admin' || !scope.personalCoupleId || scope.personalCoupleId === scope.coupleId) return null;
+  return { personal: scope.personalCoupleId, joint: scope.coupleId };
+}
+function mergeDocs(a: any[], b: any[]): ForEachSnap {
+  const byId = new Map<string, any>();
+  b.forEach((d) => byId.set(d.id, d));
+  a.forEach((d) => byId.set(d.id, d)); // personal wins over a legacy joint row with the same id
+  const all = Array.from(byId.values());
+  return { forEach: (cb) => all.forEach((d) => cb(d)) };
+}
+function onScopedSnapshot(name: string, next: (snap: any) => void, err?: (e: any) => void) {
+  const sp = twoSpaces();
+  if (!sp) return onSnapshot(scopedCol(name), next, err);
+  let mine: any[] | null = null, joint: any[] | null = null;
+  const emit = () => { if (mine !== null && joint !== null) next(mergeDocs(mine, joint)); };
+  const u1 = onSnapshot(query(collection(db, name), where('coupleId', '==', sp.personal)), (s) => { mine = s.docs; emit(); }, (e) => { mine = []; err?.(e); emit(); });
+  const u2 = onSnapshot(query(collection(db, name), where('coupleId', '==', sp.joint)), (s) => { joint = s.docs; emit(); }, () => { joint = []; emit(); });
+  return () => { u1(); u2(); };
+}
+async function getScopedDocs(name: string): Promise<any> {
+  const sp = twoSpaces();
+  if (!sp) return getDocs(scopedCol(name));
+  const [a, b] = await Promise.all([
+    getDocs(query(collection(db, name), where('coupleId', '==', sp.personal))).then((x) => x.docs).catch(() => [] as any[]),
+    getDocs(query(collection(db, name), where('coupleId', '==', sp.joint))).then((x) => x.docs).catch(() => [] as any[]),
+  ]);
+  return mergeDocs(a, b);
+}
+
 // ==========================================
 // REAL-TIME CHAT MESSAGES
 // ==========================================
@@ -466,7 +501,7 @@ export async function saveFirestoreAdminSettingDoc(_setting: AdminSetting) {
 // ==========================================
 
 export function subscribeToFirestoreMilestones(callback: (data: Milestone[]) => void) {
-  return onSnapshot(scopedCol('milestones'), (snapshot) => {
+  return onScopedSnapshot('milestones', (snapshot) => {
     const list: Milestone[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as Milestone));
@@ -499,7 +534,7 @@ export async function deleteFirestoreMilestoneDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreDatePlans(callback: (data: DatePlan[]) => void) {
-  return onSnapshot(scopedCol('datePlans'), (snapshot) => {
+  return onScopedSnapshot('datePlans', (snapshot) => {
     const list: DatePlan[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as DatePlan));
@@ -532,7 +567,7 @@ export async function deleteFirestoreDatePlanDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreMemories(callback: (data: Memory[]) => void) {
-  return onSnapshot(scopedCol('memories'), (snapshot) => {
+  return onScopedSnapshot('memories', (snapshot) => {
     const list: Memory[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as Memory));
@@ -565,7 +600,7 @@ export async function deleteFirestoreMemoryDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreLetters(callback: (data: LoveLetter[]) => void) {
-  return onSnapshot(scopedCol('letters'), (snapshot) => {
+  return onScopedSnapshot('letters', (snapshot) => {
     const list: LoveLetter[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as LoveLetter));
@@ -598,7 +633,7 @@ export async function deleteFirestoreLetterDoc(id: string) {
 // ==========================================
 
 export function subscribeToFirestoreCoupleQuestions(callback: (data: CoupleQuestion[]) => void) {
-  return onSnapshot(scopedCol('coupleQuestions'), (snapshot) => {
+  return onScopedSnapshot('coupleQuestions', (snapshot) => {
     const list: CoupleQuestion[] = [];
     snapshot.forEach((doc) => {
       list.push(normalizeCoupleId(doc.data() as CoupleQuestion));
@@ -628,7 +663,7 @@ export async function deleteFirestoreCoupleQuestionDoc(id: string) {
 
 export async function getFirestoreMilestones(): Promise<Milestone[]> {
   try {
-    const snapshot = await getDocs(scopedCol('milestones'));
+    const snapshot = await getScopedDocs('milestones');
     const list: Milestone[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as Milestone)));
     return list;
@@ -640,7 +675,7 @@ export async function getFirestoreMilestones(): Promise<Milestone[]> {
 
 export async function getFirestoreDatePlans(): Promise<DatePlan[]> {
   try {
-    const snapshot = await getDocs(scopedCol('datePlans'));
+    const snapshot = await getScopedDocs('datePlans');
     const list: DatePlan[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as DatePlan)));
     return list;
@@ -652,7 +687,7 @@ export async function getFirestoreDatePlans(): Promise<DatePlan[]> {
 
 export async function getFirestoreMemories(): Promise<Memory[]> {
   try {
-    const snapshot = await getDocs(scopedCol('memories'));
+    const snapshot = await getScopedDocs('memories');
     const list: Memory[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as Memory)));
     return list;
@@ -664,7 +699,7 @@ export async function getFirestoreMemories(): Promise<Memory[]> {
 
 export async function getFirestoreLetters(): Promise<LoveLetter[]> {
   try {
-    const snapshot = await getDocs(scopedCol('letters'));
+    const snapshot = await getScopedDocs('letters');
     const list: LoveLetter[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as LoveLetter)));
     return list;
@@ -676,7 +711,7 @@ export async function getFirestoreLetters(): Promise<LoveLetter[]> {
 
 export async function getFirestoreCoupleQuestions(): Promise<CoupleQuestion[]> {
   try {
-    const snapshot = await getDocs(scopedCol('coupleQuestions'));
+    const snapshot = await getScopedDocs('coupleQuestions');
     const list: CoupleQuestion[] = [];
     snapshot.forEach(d => list.push(normalizeCoupleId(d.data() as CoupleQuestion)));
     return list;
@@ -730,7 +765,7 @@ export async function getFirestoreChatMessages(): Promise<ChatMessage[]> {
 // ==========================================
 
 export function subscribeToFirestoreCelebrationCards(callback: (data: CelebrationCard[]) => void) {
-  return onSnapshot(scopedCol('celebrationCards'), (snapshot) => {
+  return onScopedSnapshot('celebrationCards', (snapshot) => {
     const list: CelebrationCard[] = [];
     snapshot.forEach((doc) => {
       const card = normalizeCoupleId(doc.data() as CelebrationCard);
@@ -763,7 +798,7 @@ export async function deleteFirestoreCelebrationCardDoc(id: string) {
 
 export async function getFirestoreCelebrationCards(): Promise<CelebrationCard[]> {
   try {
-    const snapshot = await getDocs(scopedCol('celebrationCards'));
+    const snapshot = await getScopedDocs('celebrationCards');
     const list: CelebrationCard[] = [];
     snapshot.forEach((d) => {
       const card = normalizeCoupleId(d.data() as CelebrationCard);
@@ -787,7 +822,7 @@ export function subscribeToFirestoreMusicTracks(
   coupleId?: string, 
   userId?: string
 ) {
-  return onSnapshot(scopedCol('musicTracks'), (snapshot) => {
+  return onScopedSnapshot('musicTracks', (snapshot) => {
     const list: MusicTrack[] = [];
     snapshot.forEach((doc) => {
       const track = normalizeCoupleId(doc.data() as MusicTrack);
@@ -826,6 +861,9 @@ export async function saveFirestoreMusicTrackDoc(track: MusicTrack) {
 
 export async function deleteFirestoreMusicTrackDoc(id: string) {
   try {
+    // Grant first and it must succeed: if it fails the track is NOT deleted (no live orphan grant). If the track delete then fails, the grant is already revoked (private, the safe direction).
+    const g = await getDoc(doc(db, 'musicGrants', id)); // the rules need an existing doc to delete, so only delete when there is one
+    if (g.exists()) await deleteDoc(doc(db, 'musicGrants', id));
     await deleteDoc(doc(db, 'musicTracks', id));
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, `musicTracks/${id}`);
@@ -834,7 +872,7 @@ export async function deleteFirestoreMusicTrackDoc(id: string) {
 
 export async function getFirestoreMusicTracks(coupleId?: string, userId?: string): Promise<MusicTrack[]> {
   try {
-    const snapshot = await getDocs(scopedCol('musicTracks'));
+    const snapshot = await getScopedDocs('musicTracks');
     const list: MusicTrack[] = [];
     snapshot.forEach((d) => {
       const track = normalizeCoupleId(d.data() as MusicTrack);
@@ -858,3 +896,28 @@ export async function getFirestoreMusicTracks(coupleId?: string, userId?: string
 }
 
 
+
+// ---- Music sharing (per track, owner's choice; rules: musicGrants + musicShared in firestore.rules.v2.DRAFT, emulator-tested) ----
+/** Owner shares one of MY personal tracks with my current partner. The partner's pid comes from the server (resolve-participant). Read-only for the partner. */
+export async function grantMusicTrack(trackId: string, granteePid: string): Promise<void> {
+  const scope: any = getFirebaseScope();
+  if (!scope?.pid || !scope?.personalCoupleId) throw new Error('No personal space');
+  await setDoc(doc(db, 'musicGrants', trackId), { trackId, ownerPid: scope.pid, granteePid, ownerSpace: scope.personalCoupleId, createdAt: new Date().toISOString() });
+}
+export async function revokeMusicGrant(trackId: string): Promise<void> { await deleteDoc(doc(db, 'musicGrants', trackId)); }
+/** Track ids I have shared. */
+export async function listMyMusicGrants(): Promise<string[]> {
+  const scope: any = getFirebaseScope();
+  if (!scope?.pid) return [];
+  const snap = await getDocs(query(collection(db, 'musicGrants'), where('ownerPid', '==', scope.pid)));
+  const ids: string[] = []; snap.forEach((d: any) => ids.push(String(d.id))); return ids;
+}
+/** Tracks my partner shared with me that are effective right now. A dormant or revoked grant is simply denied by the rules and skipped. */
+export async function listMusicSharedWithMe(): Promise<any[]> {
+  const scope: any = getFirebaseScope();
+  if (!scope?.pid) return [];
+  const grants = await getDocs(query(collection(db, 'musicGrants'), where('granteePid', '==', scope.pid)));
+  const out: any[] = [];
+  for (const g of grants.docs) { try { const t = await getDoc(doc(db, 'musicTracks', g.id)); if (t.exists()) out.push({ ...(t.data() as any), sharedFromPartner: true }); } catch { /* not effective now */ } }
+  return out;
+}

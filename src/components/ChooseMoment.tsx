@@ -1,3 +1,5 @@
+import { getFirebaseScope } from '../lib/firebaseScope';
+import { stampSpaceId, isInMySpaces } from '../lib/space';
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import confetti from 'canvas-confetti';
@@ -159,6 +161,9 @@ export function ChooseMoment({
   onLogActivity 
 }: ChooseMomentProps) {
   const coupleId = coupleTenant?.coupleId || 'couple_default';
+  const personalCoupleId = getFirebaseScope()?.personalCoupleId || '';
+  const stampId = stampSpaceId(coupleId, personalCoupleId); // new items go to the personal space once the account has one
+  const mine = (id?: string) => isInMySpaces(id, coupleId, personalCoupleId);
 
   // CARDS STATE (isolated by coupleId, with strict purging of any legacy default cards)
   const [cards, setCards] = useState<CelebrationCard[]>(() => {
@@ -189,7 +194,7 @@ export function ChooseMoment({
         const sanitized = cloudCards.filter(
           (c) => c && c.id && !c.id.startsWith('default-card-') && !c.id.startsWith('default-')
         );
-        const forTenant = coupleId ? sanitized.filter(c => !c.coupleId || c.coupleId === coupleId) : sanitized;
+        const forTenant = coupleId ? sanitized.filter(c => !c.coupleId || mine(c.coupleId)) : sanitized;
         setCards(forTenant);
       }
     }, coupleId);
@@ -425,12 +430,12 @@ export function ChooseMoment({
           const map = new Map<string, MusicTrack>();
           DEFAULT_MUSIC_TRACKS.forEach((t) => map.set(t.id, t));
           prev.forEach((t) => {
-            if (t.isPreset || t.coupleId === coupleId) {
+            if (t.isPreset || mine(t.coupleId)) {
               map.set(t.id, t);
             }
           });
           firestoreTracks.forEach((t) => {
-            if (t.isPreset || t.coupleId === coupleId) {
+            if (t.isPreset || mine(t.coupleId)) {
               map.set(t.id, t);
             }
           });
@@ -938,7 +943,7 @@ export function ChooseMoment({
       // CREATE NEW CARD
       const newCard: CelebrationCard = {
         id: `card_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        coupleId: coupleId,
+        coupleId: stampId,
         userId: currentUser,
         createdBy: currentUser,
         type: formType,
@@ -1111,7 +1116,7 @@ export function ChooseMoment({
           url: compressedDataUrl,
           type: 'image',
           createdBy: currentUser || 'Me',
-          coupleId: coupleId
+          coupleId: stampId
         };
 
         if (onAddMemory) {

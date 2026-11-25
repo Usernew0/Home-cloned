@@ -11,6 +11,7 @@ export * from './firebaseService';
 export * from './supabaseService';
 export * from './storageService';
 
+import { bulkCopyAllowed } from './firebaseScope';
 import { useState, useEffect, useCallback } from 'react';
 import { uploadMedia } from './storageService';
 import { 
@@ -350,6 +351,7 @@ export async function syncSingleTableFirestoreToSupabase(tableKey: SyncTableKey)
     syncedCount: 0,
     errors: []
   };
+  if (!(await bulkCopyAllowed())) { result.errors.push('Bulk copy of cached data is disabled unless the server confirms the old (non-strict) mode.'); return result; }
 
   if (tableKey === 'user_accounts' || tableKey === 'admin_settings') {
     result.errors.push('Account/settings records are server-only; account bulk sync is disabled.');
@@ -527,6 +529,7 @@ export async function syncSingleTableSupabaseToFirestore(tableKey: SyncTableKey)
     syncedCount: 0,
     errors: []
   };
+  if (!(await bulkCopyAllowed())) { result.errors.push('Bulk copy of cached data is disabled unless the server confirms the old (non-strict) mode.'); return result; }
 
   if (tableKey === 'user_accounts' || tableKey === 'admin_settings') {
     result.errors.push('Account/settings records are server-only; account bulk sync is disabled.');

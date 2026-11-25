@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, Suspense, lazy } from "react";
 import { endFirebaseSession, ensureFirebaseRefresh, getFirebaseScope } from "./lib/firebaseScope";
+import { stampSpaceId, isInMySpaces } from "./lib/space";
+import SharingCenter from "./components/SharingCenter";
 import { resolveParticipantPid } from "./lib/participants";
 import { motion, AnimatePresence } from "motion/react";
 import { Heart, Calendar, Image as ImageIcon, Images, Mail, Sparkles, Clock, Gift, HeartHandshake, ChevronRight, MessageSquareHeart, Lock, LogOut, Bell, BellOff, X, ChevronLeft, Volume2, VolumeX, HelpCircle, Menu, Grid, ChevronDown, ChevronUp, Crown, User, Music, Headphones, Disc } from "lucide-react";
@@ -511,6 +513,19 @@ export default function App() {
   // Active tenant filtered data lists - isolates user/couple spaces and prevents data leakage across different user accounts
   const cleanUser = currentUser.toLowerCase().trim();
   const currentCoupleId = coupleTenant.coupleId || `couple_${cleanUser}`;
+  // New items are private by default: they are stamped with the account's PERSONAL space when it is known (strict mode). Sharing is a separate per-item action.
+  const personalCoupleId = getFirebaseScope()?.personalCoupleId || "";
+  const stampCoupleId = stampSpaceId(currentCoupleId, personalCoupleId);
+  // Items still in the old joint space are read-only under the strict release: say so instead of letting the write fail silently.
+  const blockLegacyJoint = (item?: { coupleId?: string } | null) => {
+    const sc: any = getFirebaseScope();
+    if (item?.coupleId && sc?.membershipV2 === true && personalCoupleId && item.coupleId !== personalCoupleId) {
+      try { alert("ده عنصر قديم من المساحة المشتركة، للقراءة فقط. اعمل نسخة جديدة منه لو عايز تعدّل."); } catch { /* ignore */ }
+      return true;
+    }
+    return false;
+  };
+  const inMySpaces = (id?: string) => isInMySpaces(id, currentCoupleId, personalCoupleId);
 
   const activeMilestones = useMemo(() => {
     if (!Array.isArray(milestones)) return [];
@@ -520,7 +535,7 @@ export default function App() {
       const mCoupleId = m.coupleId;
       const creator = m.createdBy?.toLowerCase().trim();
 
-      if ((mCoupleId && mCoupleId === currentCoupleId) || (creator && creator === cleanUser)) {
+      if ((mCoupleId && inMySpaces(mCoupleId)) || (creator && creator === cleanUser)) {
         seen.add(m.id);
         return true;
       }
@@ -536,7 +551,7 @@ export default function App() {
       const pCoupleId = p.coupleId;
       const creator = p.createdBy?.toLowerCase().trim();
 
-      if ((pCoupleId && pCoupleId === currentCoupleId) || (creator && creator === cleanUser)) {
+      if ((pCoupleId && inMySpaces(pCoupleId)) || (creator && creator === cleanUser)) {
         seen.add(p.id);
         return true;
       }
@@ -552,7 +567,7 @@ export default function App() {
       const mCoupleId = m.coupleId;
       const creator = m.createdBy?.toLowerCase().trim();
 
-      if ((mCoupleId && mCoupleId === currentCoupleId) || (creator && creator === cleanUser)) {
+      if ((mCoupleId && inMySpaces(mCoupleId)) || (creator && creator === cleanUser)) {
         seen.add(m.id);
         return true;
       }
@@ -570,7 +585,7 @@ export default function App() {
       const recipient = l.recipient?.toLowerCase().trim();
       const creator = l.createdBy?.toLowerCase().trim();
 
-      if (sender === cleanUser || recipient === cleanUser || creator === cleanUser || (lCoupleId && lCoupleId === currentCoupleId)) {
+      if (sender === cleanUser || recipient === cleanUser || creator === cleanUser || (lCoupleId && inMySpaces(lCoupleId))) {
         seen.add(l.id);
         return true;
       }
@@ -586,7 +601,7 @@ export default function App() {
       const qCoupleId = q.coupleId;
       const creator = q.createdBy?.toLowerCase().trim();
 
-      if ((qCoupleId && qCoupleId === currentCoupleId) || (creator && creator === cleanUser) || q.isSystemPreset || q.id?.startsWith("default_") || q.id?.startsWith("preset_")) {
+      if ((qCoupleId && inMySpaces(qCoupleId)) || (creator && creator === cleanUser) || q.isSystemPreset || q.id?.startsWith("default_") || q.id?.startsWith("preset_")) {
         seen.add(q.id);
         return true;
       }
@@ -1297,6 +1312,20 @@ export default function App() {
     logActivity(username, "login", "Logged into the website successfully.");
   };
 
+  useEffect(() => {
+    // Strict release active but this session has no personal space: fail closed, ask for a fresh sign-in instead of showing empty lists.
+    const onRelogin = () => { if (sessionStorage.getItem("membership_relogin_done") === "1") return; sessionStorage.setItem("membership_relogin_done", "1"); try { alert("لازم تسجّل دخول من جديد عشان مساحتك الخاصة تتفعّل."); } catch { /* ignore */ } handleLogoutRef.current?.(); };
+    window.addEventListener("membership-relogin-required", onRelogin);
+    return () => window.removeEventListener("membership-relogin-required", onRelogin);
+  }, []);
+  const [writeFailed, setWriteFailed] = useState<string>("");
+  useEffect(() => {
+    // A write the server did not accept: the cache was reverted, lists refetch from the database. Persistent notice until dismissed.
+    const onFail = () => setWriteFailed("التعديل ما اتحفظش على السيرفر، والقايمة رجعت زي ما هي. جرّب تاني.");
+    window.addEventListener("love-write-failed", onFail);
+    return () => window.removeEventListener("love-write-failed", onFail);
+  }, []);
+  const handleLogoutRef = useRef<(() => void) | null>(null);
   const handleLogout = () => {
     const userBeforeLogout = currentUser;
     supabase?.auth.signOut().catch(() => {});
@@ -1311,10 +1340,12 @@ export default function App() {
       logActivity(userBeforeLogout, "logout", "Logged out of the website.");
     }
   };
+  handleLogoutRef.current = handleLogout;
 
   // Save changes to Firestore
   const handleUpdateMilestone = (updated: Milestone) => {
     const existing = milestones.find((m) => m.id === updated.id);
+    if (blockLegacyJoint(existing)) return;
 
     // If restoring an archived milestone, enforce total and category quotas
     if (existing?.archived && !updated.archived) {
@@ -1375,7 +1406,7 @@ export default function App() {
     }
 
     const createdBy = existing?.createdBy || updated.createdBy || currentUser;
-    const coupleId = existing?.coupleId || updated.coupleId || currentCoupleId;
+    const coupleId = existing?.coupleId || updated.coupleId || stampCoupleId;
     saveMilestoneDoc({ ...updated, createdBy, coupleId }).catch((err) => console.error("Error saving milestone:", err));
     if (currentUser) {
       logActivity(currentUser, "milestone_updated", `Updated milestone "${updated.title}"`);
@@ -1451,7 +1482,7 @@ export default function App() {
       }
     }
 
-    saveMilestoneDoc({ ...newMilestone, createdBy: currentUser, coupleId: currentCoupleId }).catch((err) => console.error("Error adding milestone:", err));
+    saveMilestoneDoc({ ...newMilestone, createdBy: currentUser, coupleId: stampCoupleId }).catch((err) => console.error("Error adding milestone:", err));
     if (currentUser) {
       logActivity(currentUser, "milestone_created", `Added a new milestone "${newMilestone.title}"`);
     }
@@ -1459,6 +1490,7 @@ export default function App() {
 
   const handleDeleteMilestone = (id: string) => {
     const item = milestones.find((m) => m.id === id);
+    if (blockLegacyJoint(item)) return;
     deleteMilestoneDoc(id).catch((err) => console.error("Error deleting milestone:", err));
     if (selectedMilestoneCategory === id) {
       setSelectedMilestoneCategory(null);
@@ -1478,7 +1510,7 @@ export default function App() {
       setIsSubscriptionModalOpen(true);
       return;
     }
-    saveDatePlanDoc({ ...newPlan, createdBy: currentUser, coupleId: currentCoupleId }).catch((err) => console.error("Error adding date plan:", err));
+    saveDatePlanDoc({ ...newPlan, createdBy: currentUser, coupleId: stampCoupleId }).catch((err) => console.error("Error adding date plan:", err));
     if (currentUser) {
       logActivity(currentUser, "date_plan_created", `Created date plan "${newPlan.title}"`);
     }
@@ -1486,8 +1518,9 @@ export default function App() {
 
   const handleUpdateDatePlan = (updated: DatePlan) => {
     const existing = datePlans.find((p) => p.id === updated.id);
+    if (blockLegacyJoint(existing)) return;
     const createdBy = existing?.createdBy || updated.createdBy || currentUser;
-    const coupleId = existing?.coupleId || updated.coupleId || currentCoupleId;
+    const coupleId = existing?.coupleId || updated.coupleId || stampCoupleId;
     saveDatePlanDoc({ ...updated, createdBy, coupleId }).catch((err) => console.error("Error updating date plan:", err));
     if (currentUser) {
       logActivity(currentUser, "date_plan_updated", `Updated date plan "${updated.title}" details/status`);
@@ -1496,6 +1529,7 @@ export default function App() {
 
   const handleDeleteDatePlan = (id: string) => {
     const item = datePlans.find((p) => p.id === id);
+    if (blockLegacyJoint(item)) return;
     deleteDatePlanDoc(id).catch((err) => console.error("Error deleting date plan:", err));
     if (currentUser && item) {
       logActivity(currentUser, "date_plan_deleted", `Deleted date plan "${item.title}"`);
@@ -1512,7 +1546,7 @@ export default function App() {
       setIsSubscriptionModalOpen(true);
       return;
     }
-    saveMemoryDoc({ ...newMemory, createdBy: currentUser, coupleId: currentCoupleId }).catch((err) => console.error("Error adding memory:", err));
+    saveMemoryDoc({ ...newMemory, createdBy: currentUser, coupleId: stampCoupleId }).catch((err) => console.error("Error adding memory:", err));
     if (currentUser) {
       logActivity(currentUser, "memory_created", `Added new scrapbook memory: "${newMemory.title}"`);
     }
@@ -1520,6 +1554,7 @@ export default function App() {
 
   const handleDeleteMemory = (id: string) => {
     const item = memories.find((m) => m.id === id);
+    if (blockLegacyJoint(item)) return;
     deleteMemoryDoc(id).catch((err) => console.error("Error deleting memory:", err));
     if (currentUser && item) {
       logActivity(currentUser, "memory_deleted", `Deleted scrapbook memory "${item.title}"`);
@@ -1528,8 +1563,9 @@ export default function App() {
 
   const handleUpdateMemory = (updated: Memory) => {
     const existing = memories.find((m) => m.id === updated.id);
+    if (blockLegacyJoint(existing)) return;
     const createdBy = existing?.createdBy || updated.createdBy || currentUser;
-    const coupleId = existing?.coupleId || updated.coupleId || currentCoupleId;
+    const coupleId = existing?.coupleId || updated.coupleId || stampCoupleId;
     saveMemoryDoc({ ...updated, createdBy, coupleId }).catch((err) => console.error("Error updating memory:", err));
     if (currentUser) {
       logActivity(currentUser, "memory_updated", `Updated memory details: "${updated.title}"`);
@@ -1546,7 +1582,7 @@ export default function App() {
       setIsSubscriptionModalOpen(true);
       return;
     }
-    saveLetterDoc({ ...newLetter, createdBy: currentUser, sender: newLetter.sender || currentUser, coupleId: currentCoupleId }).catch((err) => console.error("Error adding letter:", err));
+    saveLetterDoc({ ...newLetter, createdBy: currentUser, sender: newLetter.sender || currentUser, coupleId: stampCoupleId }).catch((err) => console.error("Error adding letter:", err));
     if (currentUser) {
       logActivity(currentUser, "letter_sent", `Sent love letter: "${newLetter.subject}"`);
       sendTelegramAlert(formatLoveLetterTelegramMessage(currentUser, newLetter.subject), "letter", {
@@ -1560,8 +1596,9 @@ export default function App() {
 
   const handleUpdateLetter = (updated: LoveLetter) => {
     const existing = letters.find((l) => l.id === updated.id);
+    if (blockLegacyJoint(existing)) return;
     const createdBy = existing?.createdBy || updated.createdBy || currentUser;
-    const coupleId = existing?.coupleId || updated.coupleId || currentCoupleId;
+    const coupleId = existing?.coupleId || updated.coupleId || stampCoupleId;
     saveLetterDoc({ ...updated, createdBy, coupleId }).catch((err) => console.error("Error updating letter:", err));
     if (currentUser) {
       logActivity(currentUser, "letter_updated", `Updated love letter details: "${updated.subject}"`);
@@ -1570,6 +1607,7 @@ export default function App() {
 
   const handleDeleteLetter = (id: string) => {
     const item = letters.find((l) => l.id === id);
+    if (blockLegacyJoint(item)) return;
     deleteLetterDoc(id).catch((err) => console.error("Error deleting letter:", err));
     if (currentUser && item) {
       logActivity(currentUser, "letter_deleted", `Deleted love letter: "${item.subject}"`);
@@ -1582,7 +1620,7 @@ export default function App() {
     const questionWithTenant = {
       ...question,
       createdBy: question.createdBy || currentUser,
-      coupleId: question.coupleId || currentCoupleId,
+      coupleId: question.coupleId || stampCoupleId,
     };
     const updated = isNew ? [questionWithTenant, ...coupleQuestions] : coupleQuestions.map((q) => (q.id === question.id ? questionWithTenant : q));
     setCoupleQuestions(updated);
@@ -1595,6 +1633,7 @@ export default function App() {
 
   const handleDeleteCoupleQuestion = async (id: string) => {
     const item = coupleQuestions.find((q) => q.id === id);
+    if (blockLegacyJoint(item)) return;
     const updated = coupleQuestions.filter((q) => q.id !== id);
     setCoupleQuestions(updated);
     storage.setCoupleQuestions(updated);
@@ -2543,6 +2582,8 @@ export default function App() {
               </Suspense>
             </ErrorBoundary>
           </main>
+          {writeFailed && <div role="alert" dir="rtl" className="fixed top-2 left-1/2 z-[80] -translate-x-1/2 rounded bg-red-600 px-4 py-2 text-sm text-white shadow-lg">{writeFailed} <button className="underline ms-2" onClick={() => setWriteFailed("")}>تمام</button></div>}
+      <SharingCenter key={`${personalCoupleId}|${coupleTenant?.coupleId || ""}|${coupleTenant?.partner1 || ""}|${coupleTenant?.partner2 || ""}`} getMusic={() => storage.getMusicTracks(personalCoupleId)} partnerUsername={coupleTenant?.partner1 && coupleTenant.partner1.toLowerCase() !== currentUser.toLowerCase() ? coupleTenant.partner1 : coupleTenant?.partner2 || ""} enabled={!!personalCoupleId && !!coupleTenant?.partner2} personalCoupleId={personalCoupleId} mine={{ milestones: activeMilestones, date_plans: activeDatePlans, memories: activeMemories, letters: activeLetters, couple_questions: activeCoupleQuestions, celebration_cards: [] }} getCards={() => storage.getCelebrationCards(currentCoupleId).filter((c: any) => c && c.coupleId)} />
 
           {/* COMPREHENSIVE FOOTER */}
           <footer className="border-t border-white/10 bg-neutral-950/40 backdrop-blur-sm py-4 text-center text-xs text-neutral-500 font-sans z-30 relative pb-20 sm:pb-4">

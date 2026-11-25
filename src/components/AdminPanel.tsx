@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { CoupleTenantRow } from "./CoupleTenantRow";
+import { linkCouple, unlinkCouple, adminCreateAccount } from "../lib/membershipClient";
 import { findTenantForUser, partnerNameFor, isSpaceUnlinked, unlinkTargets } from "../lib/coupleLink";
 import schemaSql from '../../supabase_schema.sql?raw';
 import { motion, AnimatePresence } from "motion/react";
@@ -106,6 +107,7 @@ import {
 } from "../lib/telegramService";
 
 import { saveFirestoreMusicTrackDoc, deleteFirestoreMusicTrackDoc } from "../lib/firebaseService";
+import { bulkCopyAllowed } from "../lib/firebaseScope";
 import { HorizontalScrollWrapper } from "./HorizontalScrollWrapper";
 import { MilestonesCountdownManager } from "./MilestonesCountdownManager";
 import { SecurityLogsDashboard } from "./SecurityLogsDashboard";
@@ -209,11 +211,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
   const [pairPartner1, setPairPartner1] = useState("");
   const [pairPartner2, setPairPartner2] = useState("");
   const [pairCoupleName, setPairCoupleName] = useState("");
-  const [pairPlan, setPairPlan] = useState<string>("pro");
+  const [pairPlan, setPairPlan] = useState<string>("free");
   const [newUserPartner, setNewUserPartner] = useState("");
-  const [newUserPlan, setNewUserPlan] = useState<string>("pro");
+  const [newUserPlan, setNewUserPlan] = useState<string>("free");
   const [editingUserCoupleId, setEditingUserCoupleId] = useState("");
-  const [editingUserPlan, setEditingUserPlan] = useState<string>("pro");
+  const [editingUserPlan, setEditingUserPlan] = useState<string>("free");
 
   // Telegram Bot & Alert Notifications State
   const [telegramConfig, setTelegramConfig] = useState<TelegramConfig>(() => {
@@ -1288,7 +1290,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
           coupleName: cName,
           partner1: p1,
           partner2: p2,
-          plan: "pro",
+          plan: "free",
           created_at: new Date().toISOString(),
           isFromDatabase: false,
         });
@@ -1359,7 +1361,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
           coupleName: t.coupleName,
           partner1: t.partner1,
           partner2: t.partner2,
-          plan: t.plan || "pro",
+          plan: t.plan || "free",
           created_at: t.created_at || new Date().toISOString(),
         };
         await saveCoupleTenantDoc(tenantToSave);
@@ -2452,43 +2454,17 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
 
     setIsSyncing(true);
     try {
-      const existingTenant = coupleTenants.find((t) => (t.partner1.toLowerCase() === p1.toLowerCase() && t.partner2.toLowerCase() === p2.toLowerCase()) || (t.partner1.toLowerCase() === p2.toLowerCase() && t.partner2.toLowerCase() === p1.toLowerCase()));
-      const coupleId = existingTenant ? existingTenant.coupleId : `couple_${Date.now()}`;
-
-      const newTenant: CoupleTenant = {
-        coupleId,
-        coupleName: cName,
-        partner1: p1,
-        partner2: p2,
-        plan: pairPlan,
-        created_at: new Date().toISOString(),
-      };
-
-      // 1. Save Couple Tenant doc
-      await saveCoupleTenantDoc(newTenant);
-
-      // 2. Update partner 1 account with coupleId
-      const u1 = userAccounts.find((u) => u.username.toLowerCase() === p1.toLowerCase());
-      const oldCoupleId1 = u1?.coupleId || "";
-      if (u1) {
-        await saveUserAccountDoc({ ...u1, coupleId });
+      // Linking runs on the server as one fenced operation (database and Firestore membership). Nothing is rewritten in the browser.
+      const linked = await linkCouple(p1, p2, cName);
+      if (!linked.ok) {
+        setUserErrorMsg((linked as any).error);
+        setIsSyncing(false);
+        return;
       }
-
-      // 3. Update partner 2 account with coupleId
-      const u2 = userAccounts.find((u) => u.username.toLowerCase() === p2.toLowerCase());
-      const oldCoupleId2 = u2?.coupleId || "";
-      if (u2) {
-        await saveUserAccountDoc({ ...u2, coupleId });
-      }
-
-      // 4. Update existing user data across database with the new coupleId
-      await updateDataCoupleId(oldCoupleId1, coupleId, [p1, p2]);
-      if (oldCoupleId2 && oldCoupleId2 !== oldCoupleId1) {
-        await updateDataCoupleId(oldCoupleId2, coupleId, [p1, p2]);
-      }
+      const coupleId = String(linked.data?.txId || "");
 
       const currentAdmin = localStorage.getItem("love_app_username") || "Admin";
-      await logActivity(currentAdmin, "couple_tenant_created", `Connected partners "${p1}" and "${p2}" into couple tenant "${cName}" (${coupleId}).`);
+      await logActivity(currentAdmin, "couple_tenant_created", `Connected partners "${p1}" and "${p2}" into couple tenant "${cName}" (op ${coupleId}).`);
 
       setUserSuccessMsg(`Successfully connected partners "${p1}" and "${p2}" as couple "${cName}"!`);
       setIsPairingCouple(false);
@@ -2515,12 +2491,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
         setIsSyncing(false);
         return;
       }
-      for (const u of affectedUsers) {
-        const individualCoupleId = `couple_${u.username.toLowerCase()}_${Date.now()}`;
-        await saveUserAccountDoc({ ...u, coupleId: individualCoupleId });
+      // The server restores each account's own personal space and keeps the joint space and the chat. Nothing is deleted in the browser.
+      const unlinked = await unlinkCouple(tenant.coupleId);
+      if (!unlinked.ok) {
+        setUserErrorMsg((unlinked as any).error);
+        setIsSyncing(false);
+        return;
       }
-      // 2. Delete couple tenant doc
-      await deleteCoupleTenantDoc(tenant.coupleId);
 
       const currentAdmin = localStorage.getItem("love_app_username") || "Admin";
       await logActivity(currentAdmin, "couple_tenant_unlinked", `Unlinked couple tenant "${tenant.coupleName}" (${tenant.coupleId}).`);
@@ -2562,6 +2539,23 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
     setIsSyncing(true);
     try {
       const uPass = rawPass; // plaintext over TLS; the server hashes it
+      // Decided by a FRESH server answer, never the stored scope: only a fresh "gate off" selects the legacy path; stored false, unknown or a failed refresh all take the strict server create op.
+      const strictScope = !(await bulkCopyAllowed());
+      if (strictScope) {
+        // Strict release: a new account always starts SOLO on its own personal space (the database assigns it from the account id). Joining a partner happens only through the link operation, and the message reports its real result.
+        const cr = await adminCreateAccount(newUsername.trim(), uPass, newUserGender as "male" | "female", newUserPlan || undefined);
+        if (cr.ok === false) { setUserErrorMsg(cr.error); return; }
+        const solo = { username: cr.data.account.username };
+        let msg = `Account "${solo.username}" created (solo, space ${cr.data.account.personalCoupleId}, ${(cr.data.plan || "free").toUpperCase()} plan).` + (cr.data.warnings?.length ? ` Warnings: ${cr.data.warnings.join("; ")}.` : "");
+        if (newUserPartner) {
+          const lk = await linkCouple(solo.username, newUserPartner, `${solo.username} & ${newUserPartner}`);
+          msg += lk.ok ? ` Linked with ${newUserPartner}.` : ` NOT linked with ${newUserPartner}: ${(lk as any).error}`;
+        }
+        setNewUsername(""); setNewPassword(""); setNewUserPartner(""); setNewUserPlan("free"); setNewUserGender("male");
+        setUserSuccessMsg(msg);
+        setTimeout(() => setUserSuccessMsg(null), 6000);
+        return;
+      }
       let coupleId = `couple_${Date.now()}`;
       let partnerAccount: UserAccount | undefined;
 
@@ -2588,7 +2582,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
           coupleName: `${newUser.username} & ${partnerAccount.username}`,
           partner1: newUser.username,
           partner2: partnerAccount.username,
-          plan: newUserPlan || "pro",
+          plan: newUserPlan || "free",
           created_at: new Date().toISOString(),
         };
         await saveCoupleTenantDoc(cTenant);
@@ -2600,7 +2594,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
           coupleName: `${newUser.username}'s Couple`,
           partner1: newUser.username,
           partner2: "",
-          plan: newUserPlan || "pro",
+          plan: newUserPlan || "free",
           created_at: new Date().toISOString(),
         };
         await saveCoupleTenantDoc(cTenant);
@@ -2609,7 +2603,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
       setNewUsername("");
       setNewPassword("");
       setNewUserPartner("");
-      setNewUserPlan("pro");
+      setNewUserPlan("free");
       setNewUserGender("male");
       setUserSuccessMsg(`User account "${newUser.username}" created successfully with ${newUserPlan.toUpperCase()} plan (Password Cryptographically Hashed)!${partnerAccount ? ` (Linked with partner "${partnerAccount.username}")` : ""}`);
 
@@ -2653,7 +2647,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
           coupleName: existingTenant?.coupleName || `${editingUser.username}'s Space`,
           partner1: existingTenant?.partner1 || editingUser.username,
           partner2: existingTenant?.partner2 || "",
-          plan: editingUserPlan || existingTenant?.plan || "pro",
+          plan: editingUserPlan || existingTenant?.plan || "free",
           created_at: existingTenant?.created_at || new Date().toISOString(),
         };
         await saveCoupleTenantDoc(updatedTenant);
@@ -2663,7 +2657,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
       setEditingUser(null);
       setEditingPassword("");
       setEditingUserCoupleId("");
-      setEditingUserPlan("pro");
+      setEditingUserPlan("free");
       setEditingUserGender("male");
 
       setTimeout(() => setUserSuccessMsg(null), 4000);
@@ -3598,7 +3592,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
                               setEditingUserCoupleId(user.coupleId || "");
                               setEditingUserGender(user.gender || "male");
                               const userTenant = allLinkedCoupleTenants.find((t) => t.coupleId === user.coupleId);
-                              setEditingUserPlan(userTenant?.plan || "pro");
+                              setEditingUserPlan(userTenant?.plan || "free");
                             }}
                             className="p-1.5 rounded-lg border border-white/10 hover:bg-white/5 text-neutral-400 hover:text-white transition-all cursor-pointer"
                             title="Edit Account Details"
@@ -3659,7 +3653,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
                           coupleName: t.coupleName,
                           partner1: t.partner1,
                           partner2: t.partner2,
-                          plan: t.plan || "pro",
+                          plan: t.plan || "free",
                           created_at: t.created_at || new Date().toISOString(),
                         });
                         setUserSuccessMsg(`Persisted couple tenant "${t.coupleName}" to database!`);

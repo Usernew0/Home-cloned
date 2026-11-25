@@ -1,8 +1,10 @@
+import { bulkCopyAllowed, firestoreMirrorAllowed } from "./firebaseScope";
 import { isCredentialSetting, redactCredentialRecord, saveCredentialSetting } from "./credentialSafety";
 import { supabase, isSupabaseConfigured } from "./supabase";
 import { uploadBase64Media, deleteMediaFile } from "./storageService";
 import { Milestone, DatePlan, Memory, LoveLetter, CoupleQuestion, UserAccount, AdminSetting, AdminAccount, UserActivityLog, CoupleTenant, CelebrationCard } from "../types";
 import { storage } from "../utils";
+import { ownSpaceRowsFresh } from "./ownSpaceRows";
 import {
   subscribeToFirestoreActivityLogs,
   saveActivityLogDoc,
@@ -147,8 +149,27 @@ function handleSupabaseError(context: string, error: any) {
   }
 }
 
+
+/** Live list refetchers (one per mounted list). A failed strict write calls refetchAll() so the UI shows the database state at once, not at the next realtime event. */
+const refetchers = new Set<() => void>();
+export function refetchAll() { refetchers.forEach((f) => { try { f(); } catch { /* ignore */ } }); }
+
+/** Test seam + single place for the Firestore legacy store of the six structured tables. */
+export const fsSeam: any = {
+  subAdminSettings: subscribeToFirestoreAdminSettings,
+  subMilestones: subscribeToFirestoreMilestones, subDatePlans: subscribeToFirestoreDatePlans, subMemories: subscribeToFirestoreMemories, subLetters: subscribeToFirestoreLetters, subCoupleQuestions: subscribeToFirestoreCoupleQuestions, subCelebrationCards: subscribeToFirestoreCelebrationCards,
+  subCoupleTenants: subscribeToFirestoreCoupleTenants, saveCoupleTenant: saveFirestoreCoupleTenantDoc, deleteCoupleTenant: deleteFirestoreCoupleTenantDoc, subActivityLogs: subscribeToFirestoreActivityLogs,
+  saveMilestone: saveFirestoreMilestoneDoc, deleteMilestone: deleteFirestoreMilestoneDoc, saveDatePlan: saveFirestoreDatePlanDoc, deleteDatePlan: deleteFirestoreDatePlanDoc, saveMemory: saveFirestoreMemoryDoc, deleteMemory: deleteFirestoreMemoryDoc,
+  saveLetter: saveFirestoreLetterDoc, deleteLetter: deleteFirestoreLetterDoc, saveCoupleQuestion: saveFirestoreCoupleQuestionDoc, deleteCoupleQuestion: deleteFirestoreCoupleQuestionDoc, saveCelebrationCard: saveFirestoreCelebrationCardDoc, deleteCelebrationCard: deleteFirestoreCelebrationCardDoc,
+};
+/** A failed strict write: the cache was reverted to its pre-edit snapshot; the app shows this message (App listens) and lists refetch from Supabase. */
+function notifyWriteFailed(ctx: string) { try { refetchAll(); } catch { /* ignore */ } try { window.dispatchEvent(new CustomEvent("love-write-failed", { detail: { ctx } })); } catch { /* not in a browser */ } }
+const isAdminSession = () => { try { return (JSON.parse(localStorage.getItem("love_firebase_scope") || "{}") as any).role === "admin"; } catch { return false; } };
+
 export async function proxyCall(body: {
   table: string;
+  /** "personal" (default for writes), "joint" (read-only legacy space) or "shared" (items my partner shared with me, read-only). */
+  space?: "personal" | "joint" | "shared";
   action: "select" | "insert" | "upsert" | "update" | "delete";
   select?: string;
   filters?: { column: string; operator: string; value: any }[];
@@ -338,25 +359,31 @@ export function subscribeToMilestones(callback: (data: Milestone[]) => void) {
   let initialList = storage.getMilestones();
   callback(initialList);
 
-  const unsubFirestore = subscribeToFirestoreMilestones((fsMilestones) => {
+  let unsubFirestore: (() => void) | undefined; let fsCancelled = false;
+  // Legacy Firestore listener only after a LIVE server answer says the strict gate is off (unknown or failed refresh: never attached). Emissions re-check the gate.
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsCancelled) return;
+    unsubFirestore = fsSeam.subMilestones((fsMilestones) => {
+      if (!firestoreMirrorAllowed()) return;
     if (fsMilestones && fsMilestones.length >= 0) {
       storage.saveMilestones(fsMilestones);
       callback(fsMilestones);
     }
+    });
   });
 
   if (isSupabaseConfigured && supabase) {
     const fetchMilestones = async () => {
-      const { data, error } = await supabase.from("milestones").select("*").order("date", { ascending: false });
+      const { data: rawData, error } = await supabase.from("milestones").select("*").order("date", { ascending: false });
 
-      if (!error && data) {
+      if (!error && rawData) {
+        const data = await ownSpaceRowsFresh(rawData); // never cache or call back rows of a partner share or any other space
         const mapped = data.map((item) => mapFromDb<Milestone>(item));
         storage.saveMilestones(mapped);
         callback(mapped);
       }
     };
 
-    fetchMilestones();
+    fetchMilestones(); refetchers.add(fetchMilestones);
 
     const channelName = `milestones_${Math.random().toString(36).substring(2, 9)}`;
     const channel = supabase
@@ -367,17 +394,18 @@ export function subscribeToMilestones(callback: (data: Milestone[]) => void) {
       .subscribe();
 
     return () => {
-      if (unsubFirestore) unsubFirestore();
+      refetchers.delete(fetchMilestones); fsCancelled = true; if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
   }
 
   return () => {
-    if (unsubFirestore) unsubFirestore();
+    fsCancelled = true; if (unsubFirestore) unsubFirestore();
   };
 }
 
 export async function saveMilestoneDoc(milestone: Milestone) {
+  const __snap = JSON.parse(JSON.stringify(storage.getMilestones()));
   // Ensure photo media is stored in Supabase Storage, not inline
   let photoUrls: string[] = [];
   if (milestone.photos && milestone.photos.length > 0) {
@@ -407,7 +435,7 @@ export async function saveMilestoneDoc(milestone: Milestone) {
   storage.saveMilestones(current);
 
   // Firestore update
-  await saveFirestoreMilestoneDoc(updatedMilestone);
+  if (await bulkCopyAllowed()) await fsSeam.saveMilestone(updatedMilestone);
 
   // Supabase update
   if (isSupabaseConfigured && supabase) {
@@ -415,11 +443,13 @@ export async function saveMilestoneDoc(milestone: Milestone) {
     const res = await safeUpsert("milestones", dbPayload, "id");
     if (!res.success) {
       handleSupabaseError("saveMilestoneDoc", res.error);
+      if (!firestoreMirrorAllowed()) { storage.saveMilestones(__snap); notifyWriteFailed("saveMilestoneDoc"); throw new Error("saveMilestoneDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
 
 export async function deleteMilestoneDoc(id: string) {
+  const __snap = JSON.parse(JSON.stringify(storage.getMilestones()));
   const current = storage.getMilestones();
   const milestone = current.find((m) => m.id === id);
   const filtered = current.filter((m) => m.id !== id);
@@ -431,13 +461,14 @@ export async function deleteMilestoneDoc(id: string) {
   }
 
   // Firestore update
-  await deleteFirestoreMilestoneDoc(id);
+  if (await bulkCopyAllowed()) await fsSeam.deleteMilestone(id);
 
   if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("milestones").delete().eq("id", id);
+    const { error } = await proxyCall({ table: "milestones", action: "delete", filters: [{ column: "id", operator: "eq", value: id }] });
 
     if (error) {
       handleSupabaseError("deleteMilestoneDoc", error);
+      if (!firestoreMirrorAllowed()) { storage.saveMilestones(__snap); notifyWriteFailed("deleteMilestoneDoc"); throw new Error("deleteMilestoneDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
@@ -450,25 +481,31 @@ export function subscribeToDatePlans(callback: (data: DatePlan[]) => void) {
   let initialList = storage.getDatePlans();
   callback(initialList);
 
-  const unsubFirestore = subscribeToFirestoreDatePlans((fsDatePlans) => {
+  let unsubFirestore: (() => void) | undefined; let fsCancelled = false;
+  // Legacy Firestore listener only after a LIVE server answer says the strict gate is off (unknown or failed refresh: never attached). Emissions re-check the gate.
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsCancelled) return;
+    unsubFirestore = fsSeam.subDatePlans((fsDatePlans) => {
+      if (!firestoreMirrorAllowed()) return;
     if (fsDatePlans && fsDatePlans.length >= 0) {
       storage.saveDatePlans(fsDatePlans);
       callback(fsDatePlans);
     }
+    });
   });
 
   if (isSupabaseConfigured && supabase) {
     const fetchPlans = async () => {
-      const { data, error } = await supabase.from("date_plans").select("*").order("date_time", { ascending: true });
+      const { data: rawData, error } = await supabase.from("date_plans").select("*").order("date_time", { ascending: true });
 
-      if (!error && data) {
+      if (!error && rawData) {
+        const data = await ownSpaceRowsFresh(rawData); // never cache or call back rows of a partner share or any other space
         const mapped = data.map((item) => mapFromDb<DatePlan>(item));
         storage.saveDatePlans(mapped);
         callback(mapped);
       }
     };
 
-    fetchPlans();
+    fetchPlans(); refetchers.add(fetchPlans);
 
     const channelName = `date_plans_${Math.random().toString(36).substring(2, 9)}`;
     const channel = supabase
@@ -479,17 +516,18 @@ export function subscribeToDatePlans(callback: (data: DatePlan[]) => void) {
       .subscribe();
 
     return () => {
-      if (unsubFirestore) unsubFirestore();
+      refetchers.delete(fetchPlans); fsCancelled = true; if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
   }
 
   return () => {
-    if (unsubFirestore) unsubFirestore();
+    fsCancelled = true; if (unsubFirestore) unsubFirestore();
   };
 }
 
 export async function saveDatePlanDoc(plan: DatePlan) {
+  const __snap = JSON.parse(JSON.stringify(storage.getDatePlans()));
   const planWithCouple: DatePlan = {
     ...plan,
     coupleId: plan.coupleId || "couple_default",
@@ -503,29 +541,32 @@ export async function saveDatePlanDoc(plan: DatePlan) {
   }
   storage.saveDatePlans(current);
 
-  await saveFirestoreDatePlanDoc(planWithCouple);
+  if (await bulkCopyAllowed()) await fsSeam.saveDatePlan(planWithCouple);
 
   if (isSupabaseConfigured && supabase) {
     const dbPayload = mapToDb(planWithCouple);
     const res = await safeUpsert("date_plans", dbPayload, "id");
     if (!res.success) {
       handleSupabaseError("saveDatePlanDoc", res.error);
+      if (!firestoreMirrorAllowed()) { storage.saveDatePlans(__snap); notifyWriteFailed("saveDatePlanDoc"); throw new Error("saveDatePlanDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
 
 export async function deleteDatePlanDoc(id: string) {
+  const __snap = JSON.parse(JSON.stringify(storage.getDatePlans()));
   const current = storage.getDatePlans();
   const filtered = current.filter((p) => p.id !== id);
   storage.saveDatePlans(filtered);
 
-  await deleteFirestoreDatePlanDoc(id);
+  if (await bulkCopyAllowed()) await fsSeam.deleteDatePlan(id);
 
   if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("date_plans").delete().eq("id", id);
+    const { error } = await proxyCall({ table: "date_plans", action: "delete", filters: [{ column: "id", operator: "eq", value: id }] });
 
     if (error) {
       handleSupabaseError("deleteDatePlanDoc", error);
+      if (!firestoreMirrorAllowed()) { storage.saveDatePlans(__snap); notifyWriteFailed("deleteDatePlanDoc"); throw new Error("deleteDatePlanDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
@@ -538,25 +579,31 @@ export function subscribeToMemories(callback: (data: Memory[]) => void) {
   let initialList = storage.getMemories();
   callback(initialList);
 
-  const unsubFirestore = subscribeToFirestoreMemories((fsMemories) => {
+  let unsubFirestore: (() => void) | undefined; let fsCancelled = false;
+  // Legacy Firestore listener only after a LIVE server answer says the strict gate is off (unknown or failed refresh: never attached). Emissions re-check the gate.
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsCancelled) return;
+    unsubFirestore = fsSeam.subMemories((fsMemories) => {
+      if (!firestoreMirrorAllowed()) return;
     if (fsMemories && fsMemories.length >= 0) {
       storage.saveMemories(fsMemories);
       callback(fsMemories);
     }
+    });
   });
 
   if (isSupabaseConfigured && supabase) {
     const fetchMemories = async () => {
-      const { data, error } = await supabase.from("memories").select("*").order("date", { ascending: false });
+      const { data: rawData, error } = await supabase.from("memories").select("*").order("date", { ascending: false });
 
-      if (!error && data) {
+      if (!error && rawData) {
+        const data = await ownSpaceRowsFresh(rawData); // never cache or call back rows of a partner share or any other space
         const mapped = data.map((item) => mapFromDb<Memory>(item));
         storage.saveMemories(mapped);
         callback(mapped);
       }
     };
 
-    fetchMemories();
+    fetchMemories(); refetchers.add(fetchMemories);
 
     const channelName = `memories_${Math.random().toString(36).substring(2, 9)}`;
     const channel = supabase
@@ -567,17 +614,18 @@ export function subscribeToMemories(callback: (data: Memory[]) => void) {
       .subscribe();
 
     return () => {
-      if (unsubFirestore) unsubFirestore();
+      refetchers.delete(fetchMemories); fsCancelled = true; if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
   }
 
   return () => {
-    if (unsubFirestore) unsubFirestore();
+    fsCancelled = true; if (unsubFirestore) unsubFirestore();
   };
 }
 
 export async function saveMemoryDoc(memory: Memory) {
+  const __snap = JSON.parse(JSON.stringify(storage.getMemories()));
   // Store media URL in Supabase Storage if base64
   let mediaUrl = memory.url;
   if (mediaUrl && mediaUrl.startsWith("data:")) {
@@ -599,18 +647,20 @@ export async function saveMemoryDoc(memory: Memory) {
   }
   storage.saveMemories(current);
 
-  await saveFirestoreMemoryDoc(updatedMemory);
+  if (await bulkCopyAllowed()) await fsSeam.saveMemory(updatedMemory);
 
   if (isSupabaseConfigured && supabase) {
     const dbPayload = mapToDb(updatedMemory);
     const res = await safeUpsert("memories", dbPayload, "id");
     if (!res.success) {
       handleSupabaseError("saveMemoryDoc", res.error);
+      if (!firestoreMirrorAllowed()) { storage.saveMemories(__snap); notifyWriteFailed("saveMemoryDoc"); throw new Error("saveMemoryDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
 
 export async function deleteMemoryDoc(id: string) {
+  const __snap = JSON.parse(JSON.stringify(storage.getMemories()));
   const current = storage.getMemories();
   const memory = current.find((m) => m.id === id);
   const filtered = current.filter((m) => m.id !== id);
@@ -620,13 +670,14 @@ export async function deleteMemoryDoc(id: string) {
     deleteMediaFile(memory.url);
   }
 
-  await deleteFirestoreMemoryDoc(id);
+  if (await bulkCopyAllowed()) await fsSeam.deleteMemory(id);
 
   if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("memories").delete().eq("id", id);
+    const { error } = await proxyCall({ table: "memories", action: "delete", filters: [{ column: "id", operator: "eq", value: id }] });
 
     if (error) {
       handleSupabaseError("deleteMemoryDoc", error);
+      if (!firestoreMirrorAllowed()) { storage.saveMemories(__snap); notifyWriteFailed("deleteMemoryDoc"); throw new Error("deleteMemoryDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
@@ -639,18 +690,24 @@ export function subscribeToLetters(callback: (data: LoveLetter[]) => void) {
   let initialList = storage.getLetters();
   callback(initialList);
 
-  const unsubFirestore = subscribeToFirestoreLetters((fsLetters) => {
+  let unsubFirestore: (() => void) | undefined; let fsCancelled = false;
+  // Legacy Firestore listener only after a LIVE server answer says the strict gate is off (unknown or failed refresh: never attached). Emissions re-check the gate.
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsCancelled) return;
+    unsubFirestore = fsSeam.subLetters((fsLetters) => {
+      if (!firestoreMirrorAllowed()) return;
     if (fsLetters && fsLetters.length >= 0) {
       storage.saveLetters(fsLetters);
       callback(fsLetters);
     }
+    });
   });
 
   if (isSupabaseConfigured && supabase) {
     const fetchLetters = async () => {
-      const { data, error } = await supabase.from("letters").select("*").order("date", { ascending: false });
+      const { data: rawData, error } = await supabase.from("letters").select("*").order("date", { ascending: false });
 
-      if (!error && data) {
+      if (!error && rawData) {
+        const data = await ownSpaceRowsFresh(rawData); // never cache or call back rows of a partner share or any other space
         const mapped = data.map((item) => mapFromDb<LoveLetter>(item));
         storage.saveLetters(mapped);
         callback(mapped);
@@ -659,7 +716,7 @@ export function subscribeToLetters(callback: (data: LoveLetter[]) => void) {
       }
     };
 
-    fetchLetters();
+    fetchLetters(); refetchers.add(fetchLetters);
 
     const channelName = `letters_${Math.random().toString(36).substring(2, 9)}`;
     const channel = supabase
@@ -670,17 +727,18 @@ export function subscribeToLetters(callback: (data: LoveLetter[]) => void) {
       .subscribe();
 
     return () => {
-      if (unsubFirestore) unsubFirestore();
+      refetchers.delete(fetchLetters); fsCancelled = true; if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
   }
 
   return () => {
-    if (unsubFirestore) unsubFirestore();
+    fsCancelled = true; if (unsubFirestore) unsubFirestore();
   };
 }
 
 export async function saveLetterDoc(letter: LoveLetter) {
+  const __snap = JSON.parse(JSON.stringify(storage.getLetters()));
   const letterWithCouple: LoveLetter = {
     ...letter,
     coupleId: letter.coupleId || "couple_default",
@@ -694,29 +752,32 @@ export async function saveLetterDoc(letter: LoveLetter) {
   }
   storage.saveLetters(current);
 
-  await saveFirestoreLetterDoc(letterWithCouple);
+  if (await bulkCopyAllowed()) await fsSeam.saveLetter(letterWithCouple);
 
   if (isSupabaseConfigured && supabase) {
     const dbPayload = mapToDb(letterWithCouple);
     const res = await safeUpsert("letters", dbPayload, "id");
     if (!res.success) {
       handleSupabaseError("saveLetterDoc", res.error);
+      if (!firestoreMirrorAllowed()) { storage.saveLetters(__snap); notifyWriteFailed("saveLetterDoc"); throw new Error("saveLetterDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
 
 export async function deleteLetterDoc(id: string) {
+  const __snap = JSON.parse(JSON.stringify(storage.getLetters()));
   const current = storage.getLetters();
   const filtered = current.filter((l) => l.id !== id);
   storage.saveLetters(filtered);
 
-  await deleteFirestoreLetterDoc(id);
+  if (await bulkCopyAllowed()) await fsSeam.deleteLetter(id);
 
   if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("letters").delete().eq("id", id);
+    const { error } = await proxyCall({ table: "letters", action: "delete", filters: [{ column: "id", operator: "eq", value: id }] });
 
     if (error) {
       handleSupabaseError("deleteLetterDoc", error);
+      if (!firestoreMirrorAllowed()) { storage.saveLetters(__snap); notifyWriteFailed("deleteLetterDoc"); throw new Error("deleteLetterDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
@@ -728,23 +789,31 @@ export async function deleteLetterDoc(id: string) {
 export function subscribeToCoupleQuestions(callback: (data: CoupleQuestion[]) => void) {
   callback(DEFAULT_PRE_SEEDED_QUESTIONS);
 
-  const unsubFirestore = subscribeToFirestoreCoupleQuestions((fsQuestions) => {
+  let unsubFirestore: (() => void) | undefined; let fsCancelled = false;
+  // Legacy Firestore listener only after a LIVE server answer says the strict gate is off (unknown or failed refresh: never attached). Emissions re-check the gate.
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsCancelled) return;
+    unsubFirestore = fsSeam.subCoupleQuestions((fsQuestions) => {
+      if (!firestoreMirrorAllowed()) return;
     if (fsQuestions && fsQuestions.length > 0) {
       callback(fsQuestions);
     }
+    });
   });
 
   if (isSupabaseConfigured && supabase) {
     const fetchQuestions = async () => {
-      const { data, error } = await supabase.from("couple_questions").select("*").order("created_at", { ascending: false });
+      const { data: rawData, error } = await supabase.from("couple_questions").select("*").order("created_at", { ascending: false });
+      const data = rawData ? await ownSpaceRowsFresh(rawData) : rawData; // never cache partner-shared or foreign rows
 
       if (!error && data && data.length > 0) {
         const mapped = data.map((item) => mapFromDb<CoupleQuestion>(item));
-        callback(mapped);
+        // Preset questions are code constants shown alongside the account's own rows (own row wins by id). They are never written to the database at boot; answering one saves a row in the user's own space.
+        const ownIds = new Set(mapped.map((q) => q.id));
+        callback([...mapped, ...DEFAULT_PRE_SEEDED_QUESTIONS.filter((q) => !ownIds.has(q.id))]);
       }
     };
 
-    fetchQuestions();
+    fetchQuestions(); refetchers.add(fetchQuestions);
 
     const channelName = `questions_${Math.random().toString(36).substring(2, 9)}`;
     const channel = supabase
@@ -755,40 +824,44 @@ export function subscribeToCoupleQuestions(callback: (data: CoupleQuestion[]) =>
       .subscribe();
 
     return () => {
-      if (unsubFirestore) unsubFirestore();
+      refetchers.delete(fetchQuestions); fsCancelled = true; if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
   }
 
   return () => {
-    if (unsubFirestore) unsubFirestore();
+    fsCancelled = true; if (unsubFirestore) unsubFirestore();
   };
 }
 
 export async function saveCoupleQuestionDoc(question: CoupleQuestion) {
+  const __snap = JSON.parse(JSON.stringify(storage.getCoupleQuestions()));
   const questionWithCouple: CoupleQuestion = {
     ...question,
     coupleId: question.coupleId || "couple_default",
   };
-  await saveFirestoreCoupleQuestionDoc(questionWithCouple);
+  if (await bulkCopyAllowed()) await fsSeam.saveCoupleQuestion(questionWithCouple);
 
   if (isSupabaseConfigured && supabase) {
     const dbPayload = mapToDb(questionWithCouple);
     const res = await safeUpsert("couple_questions", dbPayload, "id");
     if (!res.success) {
       handleSupabaseError("saveCoupleQuestionDoc", res.error);
+      if (!firestoreMirrorAllowed()) { storage.setCoupleQuestions(__snap); notifyWriteFailed("saveCoupleQuestionDoc"); throw new Error("saveCoupleQuestionDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
 
 export async function deleteCoupleQuestionDoc(id: string) {
-  await deleteFirestoreCoupleQuestionDoc(id);
+  const __snap = JSON.parse(JSON.stringify(storage.getCoupleQuestions()));
+  if (await bulkCopyAllowed()) await fsSeam.deleteCoupleQuestion(id);
 
   if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("couple_questions").delete().eq("id", id);
+    const { error } = await proxyCall({ table: "couple_questions", action: "delete", filters: [{ column: "id", operator: "eq", value: id }] });
 
     if (error) {
       handleSupabaseError("deleteCoupleQuestionDoc", error);
+      if (!firestoreMirrorAllowed()) { storage.setCoupleQuestions(__snap); notifyWriteFailed("deleteCoupleQuestionDoc"); throw new Error("deleteCoupleQuestionDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
@@ -801,12 +874,17 @@ export function subscribeToCelebrationCards(callback: (data: CelebrationCard[]) 
   const initialList = storage.getCelebrationCards(coupleId);
   callback(initialList);
 
-  const unsubFirestore = subscribeToFirestoreCelebrationCards((fsCards) => {
+  let unsubFirestore: (() => void) | undefined; let fsCancelled = false;
+  // Legacy Firestore listener only after a LIVE server answer says the strict gate is off (unknown or failed refresh: never attached). Emissions re-check the gate.
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsCancelled) return;
+    unsubFirestore = fsSeam.subCelebrationCards((fsCards) => {
+      if (!firestoreMirrorAllowed()) return;
     if (fsCards && fsCards.length >= 0) {
       storage.saveCelebrationCards(fsCards);
       const filtered = coupleId ? fsCards.filter((c) => !c.coupleId || c.coupleId === coupleId) : fsCards;
       callback(filtered);
     }
+    });
   });
 
   if (isSupabaseConfigured && supabase) {
@@ -818,8 +896,9 @@ export function subscribeToCelebrationCards(callback: (data: CelebrationCard[]) 
           query = query.or(`couple_id.eq.${coupleId},couple_id.is.null,couple_id.eq.couple_default`);
         }
 
-        const { data, error } = await query;
-        if (!error && data) {
+        const { data: rawCards, error } = await query;
+        if (!error && rawCards) {
+          const data = await ownSpaceRowsFresh(rawCards);
           const mapped = data.map((item) => mapFromDb<CelebrationCard>(item)).filter((c) => c && c.id && !c.id.startsWith("default-card-") && !c.id.startsWith("default-"));
           storage.saveCelebrationCards(mapped);
           const filtered = coupleId ? mapped.filter((c) => !c.coupleId || c.coupleId === coupleId) : mapped;
@@ -832,7 +911,7 @@ export function subscribeToCelebrationCards(callback: (data: CelebrationCard[]) 
       }
     };
 
-    fetchCards();
+    fetchCards(); refetchers.add(fetchCards);
 
     const channelName = `celebration_cards_${Math.random().toString(36).substring(2, 9)}`;
     const channel = supabase
@@ -843,17 +922,18 @@ export function subscribeToCelebrationCards(callback: (data: CelebrationCard[]) 
       .subscribe();
 
     return () => {
-      if (unsubFirestore) unsubFirestore();
+      refetchers.delete(fetchCards); fsCancelled = true; if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
   }
 
   return () => {
-    if (unsubFirestore) unsubFirestore();
+    fsCancelled = true; if (unsubFirestore) unsubFirestore();
   };
 }
 
 export async function saveCelebrationCardDoc(card: CelebrationCard) {
+  const __snap = JSON.parse(JSON.stringify(storage.getCelebrationCards()));
   const cardWithCouple: CelebrationCard = {
     ...card,
     coupleId: card.coupleId || "couple_default",
@@ -864,7 +944,7 @@ export async function saveCelebrationCardDoc(card: CelebrationCard) {
   storage.saveCelebrationCard(cardWithCouple);
 
   // Firestore update
-  await saveFirestoreCelebrationCardDoc(cardWithCouple);
+  if (await bulkCopyAllowed()) await fsSeam.saveCelebrationCard(cardWithCouple);
 
   // Supabase update
   if (isSupabaseConfigured && supabase) {
@@ -872,23 +952,26 @@ export async function saveCelebrationCardDoc(card: CelebrationCard) {
     const res = await safeUpsert("celebration_cards", dbPayload, "id");
     if (!res.success) {
       handleSupabaseError("saveCelebrationCardDoc", res.error);
+      if (!firestoreMirrorAllowed()) { storage.setCelebrationCards(__snap); notifyWriteFailed("saveCelebrationCardDoc"); throw new Error("saveCelebrationCardDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
 
 export async function deleteCelebrationCardDoc(id: string) {
+  const __snap = JSON.parse(JSON.stringify(storage.getCelebrationCards()));
   // Local storage update
   storage.deleteCelebrationCard(id);
 
   // Firestore update
-  await deleteFirestoreCelebrationCardDoc(id);
+  if (await bulkCopyAllowed()) await fsSeam.deleteCelebrationCard(id);
 
   // Supabase update
   if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("celebration_cards").delete().eq("id", id);
+    const { error } = await proxyCall({ table: "celebration_cards", action: "delete", filters: [{ column: "id", operator: "eq", value: id }] });
 
     if (error) {
       handleSupabaseError("deleteCelebrationCardDoc", error);
+      if (!firestoreMirrorAllowed()) { storage.setCelebrationCards(__snap); notifyWriteFailed("deleteCelebrationCardDoc"); throw new Error("deleteCelebrationCardDoc failed: the server did not save the change"); } // strict: Supabase is the only store, a failed write is never reported as success
     }
   }
 }
@@ -1017,16 +1100,21 @@ export function subscribeToCoupleTenants(callback: (data: CoupleTenant[]) => voi
   callback(initial);
   coupleTenantListeners.push(callback);
 
-  const unsubFirestore = subscribeToFirestoreCoupleTenants((fsTenants) => {
-    if (fsTenants && fsTenants.length >= 0) {
-      storage.setCoupleTenants(fsTenants);
-      notifyCoupleTenantListeners(fsTenants);
-    }
+  // Tenants carry current membership (linked pair, plan): under strict or unknown gate the saga's Supabase state is the only authority; a stale Firestore copy never overwrites it.
+  let unsubFirestore: (() => void) | undefined; let fsCancelled = false;
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsCancelled) return;
+    unsubFirestore = fsSeam.subCoupleTenants((fsTenants: any) => {
+      if (!firestoreMirrorAllowed()) return;
+      if (fsTenants && fsTenants.length >= 0) {
+        storage.setCoupleTenants(fsTenants);
+        notifyCoupleTenantListeners(fsTenants);
+      }
+    });
   });
 
   if (isSupabaseConfigured && supabase) {
     const fetchTenants = async () => {
-      const { data, error } = await supabase.from("couple_tenants").select("*");
+      const { data, error } = isAdminSession() ? await proxyCall({ table: "couple_tenants", action: "select" }) : await supabase.from("couple_tenants").select("*"); // admin pid has no personal space: RLS no longer lists tenants to it, the verified-admin proxy does
 
       if (!error && data) {
         const mapped = data.map((item) => mapFromDb<CoupleTenant>(item));
@@ -1037,7 +1125,7 @@ export function subscribeToCoupleTenants(callback: (data: CoupleTenant[]) => voi
       }
     };
 
-    fetchTenants();
+    fetchTenants(); refetchers.add(fetchTenants);
 
     const channelName = `tenants_${Math.random().toString(36).substring(2, 9)}`;
     const channel = supabase
@@ -1050,7 +1138,7 @@ export function subscribeToCoupleTenants(callback: (data: CoupleTenant[]) => voi
     return () => {
       const idx = coupleTenantListeners.indexOf(callback);
       if (idx !== -1) coupleTenantListeners.splice(idx, 1);
-      if (unsubFirestore) unsubFirestore();
+      refetchers.delete(fetchTenants); fsCancelled = true; if (unsubFirestore) unsubFirestore();
       supabase.removeChannel(channel);
     };
   }
@@ -1077,7 +1165,7 @@ export async function saveCoupleTenantDoc(tenant: CoupleTenant) {
   storage.setCoupleTenants(updatedList);
   notifyCoupleTenantListeners(updatedList);
 
-  await saveFirestoreCoupleTenantDoc(tenant);
+  if (await bulkCopyAllowed()) await fsSeam.saveCoupleTenant(tenant);
 
   if (isSupabaseConfigured && supabase) {
     const dbPayload = mapToDb(tenant);
@@ -1096,10 +1184,10 @@ export async function deleteCoupleTenantDoc(coupleId: string) {
   storage.setCoupleTenants(updatedList);
   notifyCoupleTenantListeners(updatedList);
 
-  await deleteFirestoreCoupleTenantDoc(coupleId);
+  if (await bulkCopyAllowed()) await fsSeam.deleteCoupleTenant(coupleId);
 
   if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("couple_tenants").delete().eq("couple_id", coupleId);
+    const { error } = await proxyCall({ table: "couple_tenants", action: "delete", filters: [{ column: "couple_id", operator: "eq", value: coupleId }] });
 
     if (error) {
       handleSupabaseError("deleteCoupleTenantDoc", error);
@@ -1216,12 +1304,17 @@ export function subscribeToAdminSettings(callback: (data: AdminSetting[]) => voi
     notifyAdminSettingListeners(merged);
   };
 
-  const unsubFirestore = subscribeToFirestoreAdminSettings((fsSettings) => {
+  // With the server database configured, the server is the settings authority: the Firestore copy is attached only when the page-fresh gate says legacy (false), and each emission re-checks it. Without a server database (dev) it stays as before.
+  let unsubFirestoreInner: (() => void) | undefined; let fsAdminCancelled = false;
+  const attachFsSettings = () => { unsubFirestoreInner = fsSeam.subAdminSettings((fsSettings: any) => {
+    if (isSupabaseConfigured && !firestoreMirrorAllowed()) return;
     if (fsSettings) {
-      cachedFirestoreAdminSettings = fsSettings.filter(row => !isCredentialSetting(row));
+      cachedFirestoreAdminSettings = fsSettings.filter((row: any) => !isCredentialSetting(row));
       updateAndSync();
     }
-  });
+  }); };
+  if (isSupabaseConfigured) { void bulkCopyAllowed().then((ok) => { if (ok && !fsAdminCancelled) attachFsSettings(); }); } else attachFsSettings();
+  const unsubFirestore = () => { fsAdminCancelled = true; if (unsubFirestoreInner) unsubFirestoreInner(); };
 
   if (isSupabaseConfigured) {
     const fetchSettings = async () => {
@@ -1387,9 +1480,9 @@ export function subscribeToActivityLogs(callback: (data: UserActivityLog[]) => v
   activityLogListeners.push(callback);
 
   // Subscribe to Firestore Activity Logs (for retrieving existing/historical logs)
-  const unsubscribeFirestore = subscribeToFirestoreActivityLogs((fLogs) => {
-    firestoreLogs = fLogs;
-    emitCombinedLogs();
+  let unsubscribeFirestore: (() => void) | undefined; let fsLogsCancelled = false;
+  void bulkCopyAllowed().then((ok) => { if (!ok || fsLogsCancelled) return; // strict/unknown gate: historical Firestore logs are not merged into the list
+    unsubscribeFirestore = fsSeam.subActivityLogs((fLogs: any) => { if (!firestoreMirrorAllowed()) return; firestoreLogs = fLogs; emitCombinedLogs(); });
   });
 
   // Subscribe to Supabase Activity Logs if configured
@@ -1397,10 +1490,11 @@ export function subscribeToActivityLogs(callback: (data: UserActivityLog[]) => v
   if (isSupabaseConfigured && supabase) {
     const fetchSupabaseLogs = async () => {
       try {
-        const { data, error } = await supabase.from("activity_logs").select("*").order("timestamp", { ascending: false });
+        const { data, error } = isAdminSession() ? await proxyCall({ table: "activity_logs", action: "select", order: { column: "timestamp", ascending: false } }) : await supabase.from("activity_logs").select("*").order("timestamp", { ascending: false });
 
         if (!error && data) {
-          supabaseLogs = data.map((item) => mapFromDb<UserActivityLog>(item));
+          const scoped = isAdminSession() ? data : await ownSpaceRowsFresh(data); // a member sees only their own space's logs (partner/joint/foreign rows are dropped under the strict gate)
+          supabaseLogs = scoped.map((item) => mapFromDb<UserActivityLog>(item));
           emitCombinedLogs();
         } else if (error) {
           handleSupabaseError("fetchSupabaseLogs", error);
@@ -1432,7 +1526,7 @@ export function subscribeToActivityLogs(callback: (data: UserActivityLog[]) => v
   return () => {
     const idx = activityLogListeners.indexOf(callback);
     if (idx !== -1) activityLogListeners.splice(idx, 1);
-    if (typeof unsubscribeFirestore === "function") unsubscribeFirestore();
+    fsLogsCancelled = true; if (typeof unsubscribeFirestore === "function") unsubscribeFirestore();
     if (typeof unsubscribeSupabase === "function") unsubscribeSupabase();
   };
 }
@@ -1465,7 +1559,7 @@ export async function logActivity(username: string, action: string, details: str
   if (isSupabaseConfigured && supabase) {
     try {
       const dbPayload = mapToDb(newLog);
-      const { error } = await supabase.from("activity_logs").insert(dbPayload);
+      const { error } = await proxyCall({ table: "activity_logs", action: "insert", data: dbPayload });
 
       if (!error) {
         savedInSupabase = true;
@@ -1487,86 +1581,9 @@ export async function logActivity(username: string, action: string, details: str
  * Updates couple ID across all database records when a couple ID is modified or assigned.
  */
 export async function updateDataCoupleId(oldCoupleId: string, newCoupleId: string, usernames: string[] = []) {
-  if (!newCoupleId) return;
-
-  const userLower = usernames.map((u) => u.toLowerCase());
-
-  // 1. Milestones
-  const milestones = storage.getMilestones();
-  for (const ms of milestones) {
-    const isMatch = (oldCoupleId && ms.coupleId === oldCoupleId) || (ms.createdBy && userLower.includes(ms.createdBy.toLowerCase()));
-    if (isMatch && ms.coupleId !== newCoupleId) {
-      await saveMilestoneDoc({ ...ms, coupleId: newCoupleId });
-    }
-  }
-
-  // 2. Date Plans
-  const plans = storage.getDatePlans();
-  for (const p of plans) {
-    const isMatch = (oldCoupleId && p.coupleId === oldCoupleId) || (p.createdBy && userLower.includes(p.createdBy.toLowerCase()));
-    if (isMatch && p.coupleId !== newCoupleId) {
-      await saveDatePlanDoc({ ...p, coupleId: newCoupleId });
-    }
-  }
-
-  // 3. Memories
-  const memories = storage.getMemories();
-  for (const m of memories) {
-    const isMatch = (oldCoupleId && m.coupleId === oldCoupleId) || (m.createdBy && userLower.includes(m.createdBy.toLowerCase()));
-    if (isMatch && m.coupleId !== newCoupleId) {
-      await saveMemoryDoc({ ...m, coupleId: newCoupleId });
-    }
-  }
-
-  // 4. Letters
-  const letters = storage.getLetters();
-  for (const l of letters) {
-    const isMatch = (oldCoupleId && l.coupleId === oldCoupleId) || (l.sender && userLower.includes(l.sender.toLowerCase()));
-    if (isMatch && l.coupleId !== newCoupleId) {
-      await saveLetterDoc({ ...l, coupleId: newCoupleId });
-    }
-  }
-
-  // 5. Questions
-  const questions = storage.getCoupleQuestions();
-  for (const q of questions) {
-    const isMatch = (oldCoupleId && q.coupleId === oldCoupleId) || (q.createdBy && userLower.includes(q.createdBy.toLowerCase()));
-    if (isMatch && q.coupleId !== newCoupleId) {
-      await saveCoupleQuestionDoc({ ...q, coupleId: newCoupleId });
-    }
-  }
-
-  // 5.5 Celebration Cards
-  const celebrationCards = storage.getCelebrationCards();
-  for (const c of celebrationCards) {
-    const isMatch = (oldCoupleId && c.coupleId === oldCoupleId) || (c.createdBy && userLower.includes(c.createdBy.toLowerCase())) || (c.userId && userLower.includes(c.userId.toLowerCase()));
-    if (isMatch && c.coupleId !== newCoupleId) {
-      await saveCelebrationCardDoc({ ...c, coupleId: newCoupleId });
-    }
-  }
-
-  // 6. Direct Supabase updates
-  if (isSupabaseConfigured && supabase) {
-    const tables = ["milestones", "date_plans", "memories", "letters", "couple_questions", "celebration_cards", "user_accounts", "activity_logs", "chat_messages"];
-    for (const table of tables) {
-      try {
-        if (table === "chat_messages") {
-          // Chat rows are only writable through the server proxy (admin session); direct anon-key writes are refused by the database.
-          if (oldCoupleId) await proxyCall({ table, action: "update", data: { couple_id: newCoupleId }, filters: [{ column: "couple_id", operator: "eq", value: oldCoupleId }] });
-          continue;
-        }
-        if (oldCoupleId) {
-          await supabase.from(table).update({ couple_id: newCoupleId }).eq("couple_id", oldCoupleId);
-        }
-        for (const uname of usernames) {
-          const col = table === "letters" ? "sender" : table === "user_accounts" ? "username" : "created_by";
-          await supabase.from(table).update({ couple_id: newCoupleId }).ilike(col, uname);
-        }
-      } catch (e) {
-        // Silently handle if column missing in Supabase cache
-      }
-    }
-  }
+  // Retired. Rewriting couple_id across the data tables merged private data into a shared space and bypassed per-item consent. Linking and
+  // unlinking now go through the server membership operations (link-couple / unlink-couple); data stays in each person's personal space.
+  console.warn("updateDataCoupleId is retired; data is not moved on link or unlink.", { oldCoupleId, newCoupleId, count: usernames.length });
 }
 
 /**
@@ -1671,6 +1688,7 @@ export async function syncAllDataToSupabase(): Promise<SupabaseSyncSummary> {
     errors: [],
   };
 
+  if (!(await bulkCopyAllowed())) { summary.errors.push("Bulk copy of cached data is disabled in the per-account space release."); return summary; }
   if (!isSupabaseConfigured || !supabase) {
     summary.errors.push("Supabase is not configured or offline.");
     return summary;
@@ -1810,74 +1828,9 @@ export async function syncAllDataToSupabase(): Promise<SupabaseSyncSummary> {
 /**
  * Seed initial data to Supabase if empty
  */
-export async function seedSupabaseIfEmpty() {
-  if (!isSupabaseConfigured || !supabase) return;
-
-  try {
-    // 1. Couple Questions
-    const { count: questionsCount, error: qErr } = await supabase.from("couple_questions").select("*", { count: "exact", head: true });
-
-    if (!qErr && questionsCount === 0) {
-      let questions = storage.getCoupleQuestions();
-      if (questions.length === 0) {
-        questions = DEFAULT_PRE_SEEDED_QUESTIONS;
-        storage.setCoupleQuestions(questions);
-      }
-      for (const q of questions) {
-        await safeUpsert("couple_questions", mapToDb(q));
-      }
-    }
-
-    // 2. Milestones
-    const { count: milestonesCount, error: msErr } = await supabase.from("milestones").select("*", { count: "exact", head: true });
-
-    if (!msErr && milestonesCount === 0) {
-      const localMilestones = storage.getMilestones();
-      for (const m of localMilestones) {
-        await safeUpsert("milestones", mapToDb(m));
-      }
-    }
-
-    // 3. Date Plans
-    const { count: plansCount, error: pErr } = await supabase.from("date_plans").select("*", { count: "exact", head: true });
-
-    if (!pErr && plansCount === 0) {
-      const localPlans = storage.getDatePlans();
-      for (const p of localPlans) {
-        await safeUpsert("date_plans", mapToDb(p));
-      }
-    }
-
-    // 4. Memories
-    const { count: memoriesCount, error: memErr } = await supabase.from("memories").select("*", { count: "exact", head: true });
-
-    if (!memErr && memoriesCount === 0) {
-      const localMemories = storage.getMemories();
-      for (const m of localMemories) {
-        await safeUpsert("memories", mapToDb(m));
-      }
-    }
-
-    // 5. Letters
-    const { count: lettersCount, error: lErr } = await supabase.from("letters").select("*", { count: "exact", head: true });
-
-    if (!lErr && lettersCount === 0) {
-      const localLetters = storage.getLetters();
-      for (const l of localLetters) {
-        await safeUpsert("letters", mapToDb(l));
-      }
-    }
-
-    // 6. Celebration Cards (Choose Card)
-    const { count: cardsCount, error: cErr } = await supabase.from("celebration_cards").select("*", { count: "exact", head: true });
-
-    if (!cErr && cardsCount === 0) {
-      const localCards = storage.getCelebrationCards().filter((c) => c && c.id && !c.id.startsWith("default-card-") && !c.id.startsWith("default-"));
-      for (const c of localCards) {
-        await safeUpsert("celebration_cards", mapToDb(c));
-      }
-    }
-  } catch (err) {
-    handleSupabaseError("seedSupabaseIfEmpty exception", err);
-  }
+/** Automatic cache-to-database seeding was REMOVED. It copied whatever this browser had cached (possibly another account's or a former partner's data)
+ *  into any account whose table looked empty, and "empty" can also mean an error or a different space. Nothing is written at boot now.
+ *  Items enter a space only through an explicit user action, stamped with that user's own space id. */
+export async function seedSupabaseIfEmpty(): Promise<void> {
+  return;
 }

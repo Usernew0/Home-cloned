@@ -452,3 +452,55 @@ test("proxyEntry: ?op= dispatch keeps auth, body and error semantics of each ope
   await proxyEntry(withOp("resolve-participant", { table: "user_accounts", action: "select" }, { "x-server-session": tok(alicePid, "alice") }), mix);
   assert.equal(mix.statusCode, 400);
 });
+
+test("v2 insert/upsert: a row stamped with another space is refused (409 path); unstamped and couple_default pass", async () => {
+  const { hasForeignSpaceRow } = await import("../server/handlers");
+  assert.equal(hasForeignSpaceRow([{ couple_id: "pb" }], "pa"), true);
+  assert.equal(hasForeignSpaceRow([{ couple_id: "pa" }, { couple_id: "pX" }], "pa"), true);
+  assert.equal(hasForeignSpaceRow([{ couple_id: "pa" }, { couple_id: "couple_default" }, { title: "x" }, { couple_id: "" }], "pa"), false);
+});
+
+test("chat upsert/insert as the session's own sender over another owner's id (or a legacy null-owner id) is rejected 403 and the row is unchanged", async () => {
+  reset();
+  tables.user_accounts = [
+    { id: "user_alice", username: "alice", role: "user", couple_id: "c1", pid_nonce: "aa".repeat(16) },
+    { id: "user_carl", username: "carl", role: "user", couple_id: "c1", pid_nonce: "bb".repeat(16) },
+  ];
+  const alicePid = `u:user_alice.${"aa".repeat(16)}`, carlPid = `u:user_carl.${"bb".repeat(16)}`;
+  const orig = () => [
+    { id: "d1", sender: "carl", receiver: "alice", conversation_id: "alice_carl", couple_id: "c1", sender_id: carlPid, receiver_id: alicePid, content: "original" },
+    { id: "d2", sender: "carl", receiver: "alice", conversation_id: "alice_carl", couple_id: "c1", sender_id: null, receiver_id: alicePid, content: "legacy" },
+  ];
+  const tok = createServerSession({ username: "alice", coupleId: "c1", role: "partner", pid: alicePid } as any);
+  for (const id of ["d1", "d2"]) for (const action of ["upsert"]) { // (plain insert over an existing id is a primary-key conflict in the real DB; the fake store does not model that)
+    tables.chat_messages = orig();
+    const r = mockRes();
+    await proxy(req({ table: "chat_messages", action, data: { id, sender: "alice", receiver: "carl", receiver_id: carlPid, conversation_id: "alice_carl", couple_id: "c1", content: "forged" } }, { "x-server-session": tok }), r);
+    assert.equal(r.statusCode, 403, `${action} ${id}: ${r.statusCode} ${JSON.stringify(r.body)}`);
+    assert.deepEqual(tables.chat_messages, orig());
+  }
+});
+
+test("admin tenant save never resends link fields of an existing tenant; new tenants keep theirs", async () => {
+  const { stripTenantLinkFields } = await import("../server/handlers");
+  const row = { couple_id: "j1", couple_name: "n", plan: "pro", partner1: "a", partner2: "b", pair_key: "k", link_status: "linked" };
+  const out = stripTenantLinkFields([row, { ...row, couple_id: "new1" }], new Set(["j1"]), "upsert");
+  assert.deepEqual(Object.keys(out[0]).sort(), ["couple_id", "couple_name", "plan"]);
+  assert.equal(out[1].partner1, "a"); assert.equal("pair_key" in out[1], false); assert.equal("link_status" in out[1], false);
+  assert.equal("partner2" in stripTenantLinkFields([row], new Set(), "update")[0], false);
+});
+
+test("strict admin user_accounts write: couple_id/personal_couple_id/membership_epoch never reach the database; gate off keeps couple_id but never the other two", async () => {
+  for (const enabled of [true, false]) {
+    reset();
+    tables.membership_config = [{ id: 1, enabled }];
+    if (enabled) process.env.MEMBERSHIP_V2 = "1"; else delete process.env.MEMBERSHIP_V2;
+    const before = tables.user_accounts.find((u) => u.id === "user_alice")!.couple_id;
+    const res = mockRes();
+    await proxy(req({ table: "user_accounts", action: "upsert", data: { id: "user_alice", username: "alice", plan: "pro", couple_id: "c_other", personal_couple_id: "p_other", membership_epoch: 99 }, options: { onConflict: "id" } }, { "x-server-session": tokenFor("admin") }), res);
+    const writes = calls.filter((c) => ["PATCH", "POST"].includes(c.method) && c.table === "user_accounts");
+    assert.ok(writes.length > 0, `gate ${enabled}: no write seen (${res.statusCode})`);
+    for (const w of writes) { const b = Array.isArray(w.body) ? w.body[0] : w.body; assert.equal("personal_couple_id" in b, false); assert.equal("membership_epoch" in b, false); assert.equal("couple_id" in b, !enabled ? "couple_id" in b : false); }
+    if (enabled) assert.equal(tables.user_accounts.find((u) => u.id === "user_alice")!.couple_id, before);
+  }
+});

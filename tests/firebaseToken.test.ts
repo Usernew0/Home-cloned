@@ -29,3 +29,12 @@ test("firebase token: RS256 signature verifies and carries coupleId/role claims"
   delete process.env.FIREBASE_SERVICE_ACCOUNT_EMAIL;
   delete process.env.FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY;
 });
+
+test("firebase token: personalCoupleId claim is included only when provided", () => {
+  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  process.env.FIREBASE_SERVICE_ACCOUNT_EMAIL = "svc@x.iam.gserviceaccount.com";
+  process.env.FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY = privateKey.export({ type: "pkcs8", format: "pem" }).toString().replace(/\n/g, "\\n");
+  const dec = (t: string) => JSON.parse(Buffer.from(t.split(".")[1], "base64url").toString());
+  assert.equal(dec(mintFirebaseToken({ username: "A", coupleId: "joint", role: "user", accountId: "a", pid: "u:a.n", personalCoupleId: "pa" }, 1000)!).claims.personalCoupleId, "pa");
+  assert.equal("personalCoupleId" in dec(mintFirebaseToken({ username: "A", coupleId: "c", role: "user", accountId: "a", pid: "u:a.n" }, 1000)!).claims, false);
+});

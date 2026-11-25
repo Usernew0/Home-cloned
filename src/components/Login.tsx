@@ -101,7 +101,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess, userAccounts, admi
           }
         }
         if (data.sessionToken) localStorage.setItem("love_server_session_token", data.sessionToken);
-        await startFirebaseSession({ firebaseToken: data.firebaseToken, coupleId: data.coupleId, role: data.role, username: data.username, pid: data.pid });
+        await startFirebaseSession({ firebaseToken: data.firebaseToken, coupleId: data.coupleId, role: data.role, username: data.username, pid: data.pid, personalCoupleId: data.personalCoupleId, membershipV2: data.membershipV2 === true });
         return { success: true, username: data.username };
       }
       return { success: false, requires2fa: !!data.requires2fa, error: data.error, status: res.status };

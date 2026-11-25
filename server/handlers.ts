@@ -8,7 +8,14 @@ import { sessionMatchesIdentity } from "./participant.js";
 import { authorizeProxy, stripColumns, isGlobalChatRow, visibleChatRow, isDirectChatRow, chatVisibilityOr, type Authorized, type Denied } from "./policy.js";
 import { clearFailures, isBlocked, recordFailure } from "./ratelimit.js";
 import { requireRole, sessionFromRequest } from "./guards.js";
+import { resolveMembership, chooseSpace, PERSONAL_TABLES } from "./membership.js";
+import { makeAdminAccountHandlers } from "./adminAccounts.js";
+import { membershipEnabled } from "./membership.js";
+import { makeFsPreflightHandler } from "./fsPreflight.js";
+import { makeShareHandlers, readSharedItems } from "./shares.js";
 import { resolveServerSupabaseKey } from "./serverKey.js";
+import { makeCoupleHandlers } from "./couple.js";
+import { makeMembershipHandlers } from "./membershipOps.js";
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "";
 const supabaseKey = resolveServerSupabaseKey();
@@ -181,20 +188,91 @@ async function globalLoungeOpen(session: any): Promise<boolean> {
 }
 
 /** Single entry for /api/proxy: two small endpoints share it so the deployment stays within the 12-function limit of the Vercel plan. */
+const coupleHandlers = makeCoupleHandlers(() => supabaseAdmin);
+const membershipHandlers = makeMembershipHandlers(() => supabaseAdmin);
+// Code-owned latch: with MEMBERSHIP_V2=1 link/unlink run only through the SQL-fenced saga; without it the earlier flow stays (pre-cutover releases only).
+const membershipLatched = () => String(process.env.MEMBERSHIP_V2 || "").trim() === "1";
+const PERSONAL_TABLES_SET = new Set<string>(PERSONAL_TABLES);
+const shareHandlers = makeShareHandlers(() => supabaseAdmin);
+const fsPreflightHandler = makeFsPreflightHandler(() => supabaseAdmin);
+const fsPreflightRecordHandler = makeFsPreflightHandler(() => supabaseAdmin, process.env, (globalThis as any).fetch, true);
+const adminAccountHandlers = makeAdminAccountHandlers(() => supabaseAdmin);
+
+/** v2: an explicit couple_id that is not the resolved space (couple_default = unstamped) is refused, never rewritten. */
+export function hasForeignSpaceRow(rows: any[], space: string): boolean {
+  return rows.some((r: any) => r && typeof r.couple_id === "string" && r.couple_id !== "" && r.couple_id !== "couple_default" && r.couple_id !== space);
+}
+
+/** Admin tenant saves must never resend link fields: the membership saga owns partner1/partner2/pair_key/link_status of an EXISTING tenant, so a stale browser copy cannot overwrite a link written in between. New tenants keep their fields. */
+export const TENANT_LINK_FIELDS = ["partner1", "partner2", "pair_key", "link_status"];
+export function stripTenantLinkFields(rows: any[], existingIds: Set<string>, action: string): any[] {
+  // A NEW admin tenant keeps its partners; pair_key/link_status are reserved to the membership ops.
+  return rows.map((r: any) => {
+    if (!r || typeof r !== "object") return r;
+    const c = { ...r };
+    if (action !== "update" && !existingIds.has(String(r.couple_id ?? ""))) { delete c.pair_key; delete c.link_status; return c; }
+    for (const k of TENANT_LINK_FIELDS) delete c[k];
+    return c;
+  });
+}
+
 export async function proxyEntry(req: any, res: any) {
   const raw = req.query?.op;
   if (raw === undefined || raw === "") return proxy(req, res); // the normal database proxy
   if (raw === "refresh-token") return refreshFirebaseToken(req, res);
   if (raw === "resolve-participant") return resolveParticipant(req, res);
+  if (raw === "link-couple") return (membershipLatched() ? membershipHandlers : coupleHandlers).linkCouple(req, res);
+  if (raw === "fs-probe") return membershipHandlers.fsProbe(req, res);
+  if (raw === "membership-backfill") return membershipHandlers.backfill(req, res);
+  if (raw === "membership-abort") return membershipHandlers.abort(req, res);
+  if (raw === "unlink-couple") return (membershipLatched() ? membershipHandlers : coupleHandlers).unlinkCouple(req, res);
+  if (raw === "fs-preflight") return fsPreflightHandler(req, res);
+  if (raw === "fs-preflight-record") return fsPreflightRecordHandler(req, res);
+  if (raw === "admin-create-account") return adminAccountHandlers.create(req, res);
+  if (raw === "my-shares") return shareHandlers.mine(req, res);
+  if (raw === "share-item") return shareHandlers.share(req, res);
+  if (raw === "unshare-item") return shareHandlers.unshare(req, res);
   return res.status(400).json({ success: false, error: "Unknown operation" });
 }
 
 export async function proxy(req: any, res: any) {
-  const session = sessionFromRequest(req);
-  if (!session) return res.status(401).json({ success: false, error: "Authentication required" });
+  const sessionIn = sessionFromRequest(req);
+  if (!sessionIn) return res.status(401).json({ success: false, error: "Authentication required" });
+  let session = sessionIn;
 
   try {
     if (!supabaseAdmin) return res.status(503).json({ success: false, error: "Database service unavailable" });
+    if (sessionIn.role === "admin" && req.body?.table === "couple_tenants" && ["update", "upsert"].includes(String(req.body?.action || "")) && req.body?.data) {
+      const arr = Array.isArray(req.body.data) ? req.body.data : [req.body.data];
+      const ids = arr.map((r: any) => String(r?.couple_id ?? "")).filter(Boolean);
+      const ex = ids.length ? await supabaseAdmin.from("couple_tenants").select("couple_id").in("couple_id", ids) : { data: [], error: null };
+      if (ex.error) return res.status(500).json({ success: false, error: "Tenant check failed" });
+      const out = stripTenantLinkFields(arr, new Set((ex.data || []).map((r: any) => String(r.couple_id))), String(req.body.action));
+      req.body.data = Array.isArray(req.body.data) ? out : out[0];
+    }
+    if (sessionIn.role === "admin" && req.body?.table === "user_accounts" && ["insert", "update", "upsert"].includes(String(req.body?.action || "")) && req.body?.data) {
+      const on = await membershipEnabled(supabaseAdmin, process.env);
+      if (typeof on === "object") return res.status(503).json({ success: false, error: "Membership state unavailable" });
+      for (const r of Array.isArray(req.body.data) ? req.body.data : [req.body.data]) if (r && typeof r === "object") { delete r.personal_couple_id; delete r.membership_epoch; if (on) delete r.couple_id; }
+    }
+    // Current membership decides the space, not the (possibly stale) session. Admins keep their own scope.
+    if (sessionIn.role !== "admin") {
+      const m = await resolveMembership(supabaseAdmin, sessionIn);
+      if ("error" in m) return res.status(m.status).json({ success: false, error: m.error });
+      if (req.body?.space === "shared") {
+        if (m.mode !== "v2") return res.status(409).json({ success: false, error: "Sharing is not enabled yet" });
+        const r = await readSharedItems(supabaseAdmin, m.accountId, String(req.body?.table || ""), String(req.body?.action || ""), m.locked);
+        return res.status(r.status).json(r.body);
+      }
+      const choice = chooseSpace(m, String(req.body?.table || ""), req.body?.space, sessionIn.coupleId, String(req.body?.action || ""));
+      if (choice.ok === false) return res.status(choice.status).json({ success: false, error: choice.error });
+      session = { ...sessionIn, coupleId: choice.coupleId };
+      // ("couple_default" is the client unstamped default = no explicit space.) v2: an explicit couple_id that is not the resolved space is refused, never silently rewritten (a stale or foreign row must not be saved as if it were this space's).
+      if (["insert", "upsert"].includes(String(req.body?.action || "")) && PERSONAL_TABLES_SET.has(String(req.body?.table || ""))) {
+        const rowsIn = Array.isArray(req.body?.data) ? req.body.data : req.body?.data ? [req.body.data] : [];
+        if (hasForeignSpaceRow(rowsIn, choice.coupleId)) return res.status(409).json({ success: false, error: "Item belongs to a different space" });
+      }
+    }
 
     const decision = authorizeProxy(session, req.body || {});
     if (decision.ok === false) return res.status((decision as Denied).status).json({ success: false, error: (decision as Denied).error });
@@ -216,7 +294,7 @@ export async function proxy(req: any, res: any) {
       q = applyFilters(q);
       // DB-level visibility so limit/count/single/pagination all see the same rows (the post-filter below is a second layer).
       const loungeOpen = auth.chatViewer !== undefined ? await globalLoungeOpen(session) : true;
-      if (auth.chatViewer !== undefined) q = q.or(chatVisibilityOr(auth.chatViewer, loungeOpen));
+      if (auth.chatViewer !== undefined) q = q.or(chatVisibilityOr(auth.chatViewer, loungeOpen, auth.chatCoupleId));
       if (auth.notIn?.length) q = q.not("id", "in", `(${auth.notIn.join(",")})`);
       if (auth.order) q = q.order(auth.order.column, { ascending: auth.order.ascending });
       if (auth.limit) q = q.limit(auth.limit);
@@ -248,7 +326,7 @@ export async function proxy(req: any, res: any) {
         if (key === "id") {
           const { data: existing, error } = await supabaseAdmin.from(auth.table).select(auth.table === "chat_messages" ? "id,couple_id,sender,receiver,conversation_id,sender_id,receiver_id" : "id,couple_id").in("id", auth.ownershipCheckIds);
           if (error) return res.status(500).json({ success: false, error: "Ownership check failed" });
-          if (session.role !== "admin" && (existing || []).some((r: any) => r.couple_id && r.couple_id !== session.coupleId)) {
+          if (session.role !== "admin" && !(auth.table === "chat_messages" && auth.chatSenderCheck) && (existing || []).some((r: any) => r.couple_id && r.couple_id !== session.coupleId)) {
             return res.status(403).json({ success: false, error: "Record belongs to another account" });
           }
           if (auth.chatDirectGuard && (existing || []).some((r: any) => isDirectChatRow(r) && !visibleChatRow(r, session.pid || ""))) {
@@ -380,6 +458,7 @@ export async function verifyLogin(req: any, res: any) {
     let authenticatedPid = "";
     let authenticatedGlobalChat = true;
     let authenticatedCoupleId = "couple_default";
+    let authenticatedPersonalId = "";
     let authenticatedRole: "admin" | "partner" | "guest" | "user" = "user";
     let upgradeUserId: string | null = null;
     // Two-factor material of the matched account (checked server-side; the browser never receives it).
@@ -447,6 +526,7 @@ export async function verifyLogin(req: any, res: any) {
         authenticatedPid = userPid(dbUser);
         authenticatedGlobalChat = (dbUser.enable_global_chat ?? dbUser.enableGlobalChat) !== false;
         authenticatedCoupleId = dbUser.couple_id || dbUser.coupleId || "couple_default";
+        authenticatedPersonalId = String(dbUser.personal_couple_id || "");
         authenticatedRole = dbUser.role === "admin" ? "admin" : dbUser.role === "guest" ? "guest" : "partner";
         if (needsRehash(dbUser.password)) upgradeUserId = dbUser.id;
         const enabled = dbUser.two_factor_enabled ?? dbUser.twoFactorEnabled;
@@ -533,7 +613,7 @@ export async function verifyLogin(req: any, res: any) {
       console.warn("Supabase auth session unavailable:", e?.message);
     }
 
-    return res.json({ success: true, username: authenticatedUsername, sessionToken: serverSession, supabaseSession, role: authenticatedRole, coupleId: authenticatedCoupleId, pid: authenticatedPid, firebaseToken: mintFirebaseToken({ username: authenticatedUsername, coupleId: authenticatedCoupleId, role: authenticatedRole, accountId: authenticatedAccountId, pid: authenticatedPid, globalChat: authenticatedGlobalChat }) });
+    return res.json({ success: true, username: authenticatedUsername, sessionToken: serverSession, supabaseSession, role: authenticatedRole, coupleId: authenticatedCoupleId, pid: authenticatedPid, personalCoupleId: authenticatedPersonalId, membershipV2: membershipLatched(), firebaseToken: mintFirebaseToken({ username: authenticatedUsername, coupleId: authenticatedCoupleId, role: authenticatedRole, accountId: authenticatedAccountId, pid: authenticatedPid, globalChat: authenticatedGlobalChat, personalCoupleId: authenticatedPersonalId }) });
   } catch (err: any) {
     console.error("Server login verification error:", err?.message);
     return res.status(500).json({ success: false, error: "Authentication error" });
@@ -739,10 +819,20 @@ export async function refreshFirebaseToken(req: any, res: any) {
   if (!pid) return res.status(409).json({ success: false, error: "Sign in again" });
   const accountId = pidAccountId(pid);
   let globalChat = true;
+  let liveCoupleId = session.coupleId;
+  let personalCoupleId = "";
   if (pid.startsWith("u:")) {
     const { data, error } = await supabaseAdmin.from("user_accounts").select("*").eq("id", accountId).maybeSingle();
     if (error || !data || userPid(data) !== pid) return res.status(409).json({ success: false, error: "Account not found; sign in again" });
     globalChat = data.enable_global_chat !== false;
+    personalCoupleId = String(data.personal_couple_id || "");
+    if (membershipLatched()) {
+      // Strict mode: the token carries the account's LIVE space, never the stale session value, and nothing is minted while a membership op is open.
+      const m: any = await resolveMembership(supabaseAdmin, session);
+      if (m.error) return res.status(m.status).json({ success: false, error: m.error });
+      if (m.locked) return res.status(409).json({ success: false, error: "A membership change is in progress; try again shortly" });
+      liveCoupleId = m.current;
+    }
   }
   // Best effort: carry the switch into the Supabase JWT too (new access tokens pick it up on their next refresh).
   try {
@@ -751,6 +841,6 @@ export async function refreshFirebaseToken(req: any, res: any) {
     const au = list?.users?.find((u: any) => u.email === authEmail);
     if (au) await supabaseAdmin.auth.admin.updateUserById(au.id, { app_metadata: { ...(au.app_metadata || {}), global_chat: globalChat ? "true" : "false" } });
   } catch { /* the proxy still enforces the switch live */ }
-  const firebaseToken = mintFirebaseToken({ username: session.username, coupleId: session.coupleId, role: session.role, accountId, pid, globalChat });
-  return res.json({ success: true, firebaseToken, globalChat });
+  const firebaseToken = mintFirebaseToken({ username: session.username, coupleId: liveCoupleId, role: session.role, accountId, pid, globalChat, personalCoupleId });
+  return res.json({ success: true, firebaseToken, globalChat, coupleId: liveCoupleId, personalCoupleId, membershipV2: membershipLatched() });
 }

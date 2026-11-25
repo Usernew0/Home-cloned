@@ -58,6 +58,8 @@ export type Authorized = {
   stripColumns: string[];
   /** Set for non-admin chat_messages reads: only rows this username may see are returned (see visibleChatRow). */
   chatViewer?: string;
+  /** Non-admin chat reads: couple scope applies to non-1:1 rows only. 1:1 history follows the participants, not the current space. */
+  chatCoupleId?: string;
   /** Set for non-admin chat_messages upserts: existing rows must have been sent by this username. */
   chatSenderCheck?: string;
   /** Set for admin chat_messages writes: existing rows that are 1:1 messages of other people block the write. */
@@ -103,13 +105,15 @@ export function visibleChatRow(row: any, pid: string, globalOpen = true): boolea
 }
 
 /** PostgREST or() expression: rows this account may see (participant by id, or not a 1:1 message). Values are double-quoted and escaped. */
-export function chatVisibilityOr(pid: string, globalOpen = true): string {
+export function chatVisibilityOr(pid: string, globalOpen = true, coupleId?: string): string {
   const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
   const group = q("group\\_%");
+  // Non-1:1 rows keep the couple scope when a coupleId is given; 1:1 rows are matched on the permanent pids only (never on the current space).
+  const cs = coupleId ? `couple_id.eq.${q(coupleId)},` : "";
   const parts = [
-    `and(receiver.is.null,conversation_id.is.null)`,
-    ...(globalOpen ? [`and(receiver.eq.global,conversation_id.eq.global)`] : []),
-    `and(receiver.like.${group},conversation_id.like.${group})`,
+    `and(${cs}receiver.is.null,conversation_id.is.null)`,
+    ...(globalOpen ? [`and(${cs}receiver.eq.global,conversation_id.eq.global)`] : []),
+    `and(${cs}receiver.like.${group},conversation_id.like.${group})`,
   ];
   if (pid) parts.unshift(`sender_id.eq.${q(pid)}`, `receiver_id.eq.${q(pid)}`);
   return parts.join(",");
@@ -162,7 +166,7 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
   }
 
   // Tenant scoping for non-admins.
-  const scoped = !isAdmin && (isCoupleTable(table) || table === "couple_tenants" || table === "user_accounts");
+  const scoped = !isAdmin && table !== "chat_messages" && (isCoupleTable(table) || table === "couple_tenants" || table === "user_accounts");
   const scopeColumn = "couple_id";
   let scopedFilters = filters;
   if (scoped) {
@@ -173,11 +177,13 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
 
   // Chat messages: direct (1:1) messages belong to their two participants, not to the sender's couple and not to app admins.
   let chatViewer: string | undefined;
+  let chatCoupleId: string | undefined;
   let chatSenderCheck: string | undefined;
   let chatDirectGuard = false;
   if (table === "chat_messages") {
     const myPid = session.pid || "";
     if (action === "select") chatViewer = myPid; // "" is allowed: such a session sees only non-1:1 rows
+    if (action === "select" && !isAdmin) chatCoupleId = session.coupleId;
     if (!isAdmin && (action === "update" || action === "delete")) {
       // Only the sender (matched on the permanent id bound into the session) may edit or delete their own message.
       if (!myPid) return deny(403, "Sign in again to use chat");
@@ -324,6 +330,7 @@ export function authorizeProxy(session: ServerSessionPayload, body: ProxyBody): 
     ownershipCheckIds,
     stripColumns,
     chatViewer,
+    chatCoupleId,
     chatSenderCheck,
     chatDirectGuard,
     chatReturnViewer: table === "chat_messages" ? (session.pid || "") : undefined,

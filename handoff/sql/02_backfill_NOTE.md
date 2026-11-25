@@ -1,0 +1,1 @@
+02 = backfill of personal_couple_id for accounts without one. For TEST this is the reviewed legacy_preflight.sql / legacy_apply.sql flow (read the preflight output first); for the real projects it is a separate read-only inspection task. Not part of this draft.
