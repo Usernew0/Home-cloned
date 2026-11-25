@@ -1,6 +1,7 @@
 import { requireRole } from "./guards.js";
 import { visibleChatRow, isDirectChatRow } from "./policy.js";
 import { keysOf, BACKUP_TABLES } from "../src/lib/backupKeys.js";
+import { readCatalog, readTablePage, withReadOnly, isIdent, type Catalog, type Q } from "./backupCatalog.js";
 import { isFirestoreRestConfigured, makeTokenProvider } from "./firestoreRest.js";
 
 /**
@@ -147,7 +148,9 @@ const ascii = (s: any, n = 140) => String(s ?? "").replace(/[^\x20-\x7e]/g, " ")
 /** A SEPARATE backup source (BACKUP_SOURCE_*): lets the app read another project (for example the old one) for backup without changing the app's own database, login or runtime. */
 export const separateConfigured = (env: Record<string, string | undefined>) => !!(env.BACKUP_SOURCE_SUPABASE_URL || env.BACKUP_SOURCE_FIREBASE_PROJECT_ID);
 
-export function makeBackupHandlers(getDb: () => any, env: Record<string, string | undefined> = process.env, fetchImpl: any = (globalThis as any).fetch, redactAdmin: (r: any) => any = (r) => r, getSeparateDb: () => any = () => null) {
+const STORAGE_ID = /^[A-Za-z0-9_.-]{1,100}$/; const STORAGE_CHUNK = 2 * 1024 * 1024;
+const storagePathOk = (p: string) => p.length > 0 && p.length < 1000 && !p.startsWith("/") && !/[\u0000-\u001f\u007f]/.test(p) && p.split("/").every((s) => s.length > 0 && s !== "." && s !== "..");
+export function makeBackupHandlers(getDb: () => any, env: Record<string, string | undefined> = process.env, fetchImpl: any = (globalThis as any).fetch, redactAdmin: (r: any) => any = (r) => r, getSeparateDb: () => any = () => null, getRestAccess: (target: "app" | "separate") => { url: string; key: string } | null = () => null, getPg: (target: "app" | "separate") => (() => Promise<{ query: Q; close: () => Promise<void> }>) | null = () => null) {
   const fsBase = (project: string) => `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents`;
   const tokens: Record<string, () => Promise<string>> = {};
   type Ctx = { target: "app" | "separate"; db: any; sbUrl: string; fsEnv: Record<string, string | undefined>; project: string; fsOk: boolean; token: () => Promise<string> };
@@ -171,22 +174,75 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
   };
   const noStore = (res: any) => { try { res.setHeader?.("Cache-Control", "no-store"); } catch { /* ignore */ } };
 
+  /** Live inventory of the public tables: the project's own REST description (service key). Never trusts the fixed list alone. A failure is reported, never hidden. */
+  const discCache: Record<string, { at: number; v: any }> = {};
+  const TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
+  async function discoverTables(target: "app" | "separate"): Promise<{ ok: boolean; names: string[]; pks: Record<string, string[]>; reason?: string }> {
+    const hit = discCache[target]; if (hit && Date.now() - hit.at < 60000) return hit.v;
+    const a = getRestAccess(target);
+    let v: any;
+    if (!a || !a.url || !a.key) v = { ok: false, names: [], pks: {}, reason: "no service access for table discovery" };
+    else {
+      try {
+        const r = await fetchImpl(`${a.url.replace(/\/+$/, "")}/rest/v1/`, { method: "GET", headers: { apikey: a.key, Authorization: `Bearer ${a.key}`, Accept: "application/openapi+json" } });
+        const j: any = await r.json().catch(() => null);
+        const defs = j?.definitions || j?.components?.schemas;
+        if (!r.ok || !defs || typeof defs !== "object") v = { ok: false, names: [], pks: {}, reason: `the project did not return its table list (${r.status})` };
+        else {
+          const names = Object.keys(defs).filter((n) => TABLE_NAME.test(n)).sort(); const pks: Record<string, string[]> = {};
+          for (const n of names) { const props = defs[n]?.properties || {}; const pk = Object.keys(props).filter((k) => /<pk\/>/.test(String(props[k]?.description || ""))); if (pk.length) pks[n] = pk; }
+          v = { ok: true, names, pks };
+        }
+      } catch (e: any) { v = { ok: false, names: [], pks: {}, reason: `table discovery failed: ${ascii(e?.message, 80)}` }; }
+    }
+    discCache[target] = { at: Date.now(), v }; return v;
+  }
+
+  /** Direct database inventory (needs SUPABASE_DB_URL). One short read-only snapshot per call; cached 30s so paging does not re-read the catalog. */
+  const catCache: Record<string, { at: number; v: Catalog }> = {};
+  async function pgRun<T>(target: "app" | "separate", fn: (q: Q) => Promise<T>): Promise<T> {
+    const open = getPg(target); if (!open) throw new Error("no database connection configured");
+    const cl = await open();
+    try { return await withReadOnly({ query: cl.query }, fn); } finally { await cl.close().catch(() => {}); }
+  }
+  async function catalogFor(target: "app" | "separate", fresh = false): Promise<Catalog> {
+    const hit = catCache[target]; if (!fresh && hit && Date.now() - hit.at < 30000) return hit.v;
+    const v = await pgRun(target, (q) => readCatalog(q)); catCache[target] = { at: Date.now(), v }; return v;
+  }
+
   async function plan(req: any, res: any) {
     if (!requireRole(req, res, ["admin"])) return;
     noStore(res);
     const c = ctxFor(req.body?.target === "separate" ? "separate" : "app");
     if (!c) return res.status(400).json({ success: false, error: "No separate backup source is configured on the server" });
     const { host, ref } = refOf(c.sbUrl);
-    const out: any = { success: true, target: c.target, targets: [{ id: "app", label: "This app's own connection" }, ...(separateConfigured(env) ? [{ id: "separate", label: "Separately configured backup source" }] : [])], supabase: { available: !!c.db, tables: [...BACKUP_TABLES], ref: ref || null, host: host || null }, firestore: { available: false, project: c.project || null, collections: [] as string[], note: "" } };
+    const out: any = { success: true, target: c.target, targets: [{ id: "app", label: "This app's own connection" }, ...(separateConfigured(env) ? [{ id: "separate", label: "Separately configured backup source" }] : [])], supabase: { available: !!c.db, tables: [...BACKUP_TABLES] as string[], ref: ref || null, host: host || null, discovery: null as any, keys: {} as Record<string, string[]> }, firestore: { available: false, project: c.project || null, collections: [] as string[], note: "" } };
+    if (c.db) {
+      const d = await discoverTables(c.target);
+      const known = BACKUP_TABLES as readonly string[];
+      const unknown = d.ok ? d.names.filter((n) => !known.includes(n)) : [];
+      out.supabase.tables = [...known, ...unknown]; out.supabase.keys = Object.fromEntries(unknown.filter((n) => d.pks[n]).map((n) => [n, d.pks[n]]));
+      out.supabase.discovery = d.ok ? { ok: true, found: d.names.length, extraTables: unknown, listedButNotInProject: known.filter((n) => !d.names.includes(n)), withoutPrimaryKey: unknown.filter((n) => !d.pks[n]) } : { ok: false, reason: d.reason, note: "Only the fixed list of 17 tables is read. Any other table in this project is NOT covered." };
+    }
+    if (getPg(c.target)) {
+      try { const cat = await catalogFor(c.target, true); out.catalog = { ok: true, data: cat, dbRef: getPg(c.target) && (getPg(c.target) as any).ref ? (getPg(c.target) as any).ref : undefined }; }
+      catch (e: any) { out.catalog = { ok: false, reason: `database connection failed: ${ascii(String(e?.code ? `${e.code} ` : "") + String(/certificate|self.signed|altnames|unable to verify/i.test(String(e?.message)) ? "TLS verification failed (not a password problem): " + String(e?.message) : "") + String(/^(BAD_URL|WRONG_PROJECT)$/.test(String(e?.code)) || /certificate|self.signed|hostname|altnames|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|password authentication|timeout/i.test(String(e?.message)) ? e?.message : "connection error").replace(/postgres(ql)?:\/\/\S+/gi, "[url]"), 120)}` }; }
+    } else out.catalog = { ok: false, reason: c.target === "separate" ? "BACKUP_SOURCE_SUPABASE_DB_URL is not set on the server" : "SUPABASE_DB_URL is not set on the server" };
     const project = () => c.project; const fsConfigured = () => c.fsOk; const token = c.token;
     if (!fsConfigured()) out.firestore.note = c.target === "separate" ? "Firestore is off: BACKUP_SOURCE_FIREBASE_SERVICE_ACCOUNT_EMAIL and BACKUP_SOURCE_FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY are not both set on the server." : "Firestore is off: FIREBASE_SERVICE_ACCOUNT_EMAIL and FIREBASE_SERVICE_ACCOUNT_PRIVATE_KEY are not both set on the server.";
     else if (!project()) out.firestore.note = c.target === "separate" ? "Firestore is off: BACKUP_SOURCE_FIREBASE_PROJECT_ID is not set on the server. The service account is set." : "Firestore is off: FIREBASE_PROJECT_ID is not set on the server. The service account is set.";
     else {
       try {
-        const r = await fetchImpl(`${fsBase(project())}:listCollectionIds`, { method: "POST", headers: { Authorization: `Bearer ${await token()}`, "Content-Type": "application/json" }, body: JSON.stringify({ pageSize: 300 }) });
-        const j: any = await r.json().catch(() => ({}));
-        if (!r.ok) out.firestore.note = `Firestore refused the collection list (${r.status}).`;
-        else { out.firestore.available = true; const found = (j.collectionIds || []).map(String); out.firestore.collections = found.filter(isExportablePath); out.firestore.notExported = found.filter((x: string) => !isExportablePath(x)); if (j.nextPageToken) out.firestore.note = "More collections exist than one page lists; the rest are not included."; }
+        const found: string[] = []; let pageToken: string | undefined; let refused = 0; let pages = 0;
+        do {
+          const r = await fetchImpl(`${fsBase(project())}:listCollectionIds`, { method: "POST", headers: { Authorization: `Bearer ${await token()}`, "Content-Type": "application/json" }, body: JSON.stringify(pageToken ? { pageSize: 300, pageToken } : { pageSize: 300 }) });
+          const j: any = await r.json().catch(() => ({}));
+          if (!r.ok) { refused = r.status; break; }
+          found.push(...(j.collectionIds || []).map(String)); pageToken = j.nextPageToken || undefined;
+        } while (pageToken && ++pages < 50);
+        if (refused) out.firestore.note = `Firestore refused the collection list (${refused}).`;
+        else if (pageToken) { out.firestore.listIncomplete = true; out.firestore.note = "The collection list has more than 50 pages: not all collections are known, so Firestore is not exported (nothing is silently dropped)."; }
+        else { out.firestore.available = true; out.firestore.allCollections = found; out.firestore.collections = found.filter(isExportablePath); out.firestore.notExported = found.filter((x: string) => !isExportablePath(x)); }
       } catch (e: any) { out.firestore.note = `Firestore could not be reached: ${ascii(e?.message, 80)}`; }
     }
     return res.json(out);
@@ -204,15 +260,63 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
     const full = req.body?.full === true;
     const pid = String(session.pid || ""); const cid = String((session as any).coupleId || "");
     try {
+      if (source === "storage") {
+        if (!full) return res.status(400).json({ success: false, error: "Storage files are part of the Encrypted data copy only" });
+        const a = getRestAccess(c.target); if (!a || !a.url || !a.key) return res.status(503).json({ success: false, error: "Storage access is not configured for this source" });
+        const base = `${a.url.replace(/\/+$/, "")}/storage/v1`; const hdr = { apikey: a.key, Authorization: `Bearer ${a.key}` };
+        const action = String(req.body?.action || "");
+        if (action === "buckets") {
+          const r = await fetchImpl(`${base}/bucket`, { headers: hdr }); const j: any = await r.json().catch(() => null);
+          if (!r.ok || !Array.isArray(j)) return res.status(502).json({ success: false, error: `Storage bucket list failed (${r.status})` });
+          return res.json({ success: true, buckets: j.map((b: any) => ({ id: String(b.id), name: String(b.name), public: !!b.public })).filter((b: any) => STORAGE_ID.test(b.id)), dropped: j.filter((b: any) => !STORAGE_ID.test(String(b?.id))).length });
+        }
+        const bucket = String(req.body?.bucket || ""); if (!STORAGE_ID.test(bucket)) return res.status(400).json({ success: false, error: "Invalid bucket" });
+        if (action === "list") {
+          const prefix = String(req.body?.prefix || ""); if (prefix && !storagePathOk(prefix)) return res.status(400).json({ success: false, error: "Invalid path" });
+          const offset = Math.max(0, Math.floor(Number(req.body?.offset) || 0));
+          const r = await fetchImpl(`${base}/object/list/${encodeURIComponent(bucket)}`, { method: "POST", headers: { ...hdr, "Content-Type": "application/json" }, body: JSON.stringify({ prefix, limit: 100, offset, sortBy: { column: "name", order: "asc" } }) });
+          const j: any = await r.json().catch(() => null);
+          if (!r.ok || !Array.isArray(j)) return res.status(502).json({ success: false, error: `Storage list failed (${r.status})` });
+          const items = j.map((o: any) => ({ name: String(o.name), folder: o.id === null || o.id === undefined, size: Number(o?.metadata?.size ?? 0), mime: String(o?.metadata?.mimetype ?? "") }));
+          const bad = items.filter((o: any) => !o.name || o.name.includes("/") || o.name === "." || o.name === "..").length;
+          return res.json({ success: true, items: items.filter((o: any) => o.name && !o.name.includes("/") && o.name !== "." && o.name !== ".."), invalidNames: bad, next: j.length === 100 ? offset + 100 : null });
+        }
+        if (action === "get") {
+          const path = String(req.body?.path || ""); if (!storagePathOk(path)) return res.status(400).json({ success: false, error: "Invalid path" });
+          const chunk = Math.max(0, Math.floor(Number(req.body?.chunk) || 0)); const start = chunk * STORAGE_CHUNK;
+          const r = await fetchImpl(`${base}/object/${encodeURIComponent(bucket)}/${path.split("/").map(encodeURIComponent).join("/")}`, { headers: { ...hdr, Range: `bytes=${start}-${start + STORAGE_CHUNK - 1}` } });
+          if (!(r.status === 200 || r.status === 206)) return res.status(502).json({ success: false, error: `Storage file read failed (${r.status})` });
+          const buf = Buffer.from(await r.arrayBuffer());
+          let total = buf.length; const cr = /\/(\d+)$/.exec(String(r.headers?.get?.("content-range") || "")); let data = buf;
+          if (r.status === 206 && cr) total = Number(cr[1]); else if (r.status === 200) { total = buf.length; data = buf.subarray(start, start + STORAGE_CHUNK); }
+          return res.json({ success: true, b64: data.toString("base64"), total, chunks: Math.max(1, Math.ceil(total / STORAGE_CHUNK)), chunk });
+        }
+        return res.status(400).json({ success: false, error: "Unknown storage action" });
+      }
+      if (source === "pg") {
+        if (!full) return res.status(400).json({ success: false, error: "The database-level copy is part of the Encrypted data copy only" });
+        const table = String(req.body?.table || ""); const [sc, nm, ...rest] = table.split(".");
+        if (rest.length || !isIdent(sc) || !isIdent(nm)) return res.status(400).json({ success: false, error: "Unknown table" });
+        const offset = Math.max(0, Math.floor(Number(req.body?.offset) || 0));
+        let cat: Catalog; try { cat = await catalogFor(c.target); } catch { return res.status(502).json({ success: false, error: "Database connection failed" }); }
+        if (!cat.tables.some((t) => t.schema === sc && t.name === nm)) return res.status(400).json({ success: false, error: "Unknown table" });
+        let pg; try { pg = await pgRun(c.target, (q) => readTablePage(q, cat, sc, nm, offset, MAX_ROWS)); } catch { return res.status(502).json({ success: false, error: "Table could not be read" }); }
+        const unsafe = pg.unsafeNumbers; const fit = fitRows(pg.rows);
+        const more = fit.used < pg.rows.length || pg.rows.length === MAX_ROWS;
+        return res.json({ success: true, rows: fit.rows, next: more ? offset + fit.used : null, total: pg.total, oversize: fit.oversize, excludedPrivate: 0, unsafeNumbers: unsafe, removedKeys: [], keyless: pg.keyless });
+      }
       if (source === "supabase") {
         const db = c.db;
         if (!db) return res.status(503).json({ success: false, error: "Database service unavailable" });
         const table = String(req.body?.table || "");
-        if (!(BACKUP_TABLES as readonly string[]).includes(table)) return res.status(400).json({ success: false, error: "Unknown table" });
+        const knownTable = (BACKUP_TABLES as readonly string[]).includes(table);
+        const disc = knownTable ? null : await discoverTables(c.target);
+        if (!knownTable && !(disc && disc.ok && TABLE_NAME.test(table) && disc.names.includes(table))) return res.status(400).json({ success: false, error: "Unknown table" });
+        const orderKeys = knownTable ? keysOf(table) : (disc!.pks[table] || ["id"]);
         const offset = Math.max(0, Math.floor(Number(req.body?.offset) || 0));
         const run = (orderKeys: string[]) => orderKeys.reduce((q: any, k: string) => q.order(k, { ascending: true }), db.from(table).select("*", offset === 0 ? { count: "exact" } : undefined)).range(offset, offset + MAX_ROWS - 1);
         const notFound = (e: any) => String(e?.code) === "42P01" || String(e?.code) === "PGRST205" || /does not exist|schema cache|could not find the table/i.test(String(e?.message || ""));
-        let r = await run(keysOf(table));
+        let r = await run(orderKeys);
         if (r.error) { // no id column: order by the table's first column so paging stays stable
           const probe = await db.from(table).select("*").limit(1);
           if (probe.error) {
@@ -227,8 +331,8 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
         const removed = new Set<string>();
         let data: any[] = r.data || [];
         let excluded = 0;
-        const keepRow = (x: any) => table === "chat_messages" ? (c.target === "app" && keepChatRow(x, pid, cid)) : table === "deleted_rows_backup" ? x?.src_table !== "chat_messages" : true; // deleted chat rows keep the same privacy rule: left out whole
-        if (table === "chat_messages" || table === "deleted_rows_backup") { const kept = data.filter(keepRow); excluded = data.length - kept.length; data = kept; }
+        const keepRow = (x: any) => full ? true : table === "chat_messages" ? (c.target === "app" && keepChatRow(x, pid, cid)) : table === "deleted_rows_backup" ? x?.src_table !== "chat_messages" : true; // deleted chat rows keep the same privacy rule: left out whole
+        if (!full && (table === "chat_messages" || table === "deleted_rows_backup")) { const kept = data.filter(keepRow); excluded = data.length - kept.length; data = kept; }
         const unsafe = countUnsafeNumbers(data);
         const cleaned = data.map((x: any) => exportRow(table, x, removed, redactAdmin, full));
         const fit = fitRows(cleaned);
@@ -248,7 +352,7 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
         const col = String(req.body?.collection || "");
         if (!COLLECTION_PATH.test(col)) return res.status(400).json({ success: false, error: "Invalid collection" });
         const segs = col.split("/"); const id = segs[segs.length - 1];
-        if (!isExportablePath(col)) return res.json({ success: true, rows: [], next: null, excludedPath: true, reason: segs.length > 1 ? "nested collection: found, not exported (the app does not use nested collections)" : "not on the known app collection list: not exported, needs a decision", subcollections: [] });
+        if (!full && !isExportablePath(col)) return res.json({ success: true, rows: [], next: null, excludedPath: true, reason: segs.length > 1 ? "nested collection: found, not exported (the app does not use nested collections)" : "not on the known app collection list: not exported, needs a decision", subcollections: [] });
         const tok = String(req.body?.pageToken || "");
         const url = `${fsBase(project())}/${encPath(col)}?pageSize=${MAX_ROWS}&showMissing=true${tok ? `&pageToken=${encodeURIComponent(tok)}` : ""}`;
         const r = await fetchImpl(url, { method: "GET", headers: { Authorization: `Bearer ${await token()}` } });
@@ -257,7 +361,7 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
         const removed = new Set<string>();
         let rawDocs: any[] = j.documents || [];
         let excluded = 0;
-        if (id === "chatMessages") { const kept = rawDocs.filter((d) => c.target === "app" && keepChatRow(decodeDoc(d), pid, cid)); excluded = rawDocs.length - kept.length; rawDocs = kept; }
+        if (!full && id === "chatMessages") { const kept = rawDocs.filter((d) => c.target === "app" && keepChatRow(decodeDoc(d), pid, cid)); excluded = rawDocs.length - kept.length; rawDocs = kept; }
         const docs = rawDocs.map((d: any) => {
           const path = String(d.name || "").split("/documents/")[1] || "";
           return full ? { _path: path, _id: decodeDoc(d)._id, ...(d.createTime ? {} : { _missing: true }), createTime: d.createTime ?? null, updateTime: d.updateTime ?? null, fields: d.fields || {} } : stripSecrets({ _path: path, ...(d.createTime ? {} : { _missing: true }), ...decodeDoc(d) }, removed);
@@ -267,15 +371,20 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
         if (fit.used < docs.length) return res.status(413).json({ success: false, error: "A Firestore page was too large for one response; nothing was dropped, the export for this collection stopped." });
         // Subcollections of these documents (bounded fan-out), so nothing nested is silently missed.
         const subs = new Set<string>(); let subFail = 0;
-        if (segs.length < 5) {
+        {
           const paths = rawDocs.map((d: any) => String(d.name || "").split("/documents/")[1]).filter(Boolean);
           for (let k = 0; k < paths.length; k += 8) {
             await Promise.all(paths.slice(k, k + 8).map(async (dp) => {
               try {
-                const lr = await fetchImpl(`${fsBase(project())}/${encPath(dp)}:listCollectionIds`, { method: "POST", headers: { Authorization: `Bearer ${await token()}`, "Content-Type": "application/json" }, body: JSON.stringify({ pageSize: 100 }) });
-                const lj: any = await lr.json().catch(() => ({}));
-                if (!lr.ok) { subFail++; return; }
-                for (const c of lj.collectionIds || []) subs.add(`${dp}/${c}`);
+                let tk: string | undefined; let pg = 0;
+                do {
+                  const lr = await fetchImpl(`${fsBase(project())}/${encPath(dp)}:listCollectionIds`, { method: "POST", headers: { Authorization: `Bearer ${await token()}`, "Content-Type": "application/json" }, body: JSON.stringify(tk ? { pageSize: 100, pageToken: tk } : { pageSize: 100 }) });
+                  const lj: any = await lr.json().catch(() => ({}));
+                  if (!lr.ok) { subFail++; return; }
+                  for (const c of lj.collectionIds || []) { if (dp.split("/").length >= 18) subFail++; else subs.add(`${dp}/${c}`); }
+                  tk = lj.nextPageToken || undefined;
+                } while (tk && ++pg < 50);
+                if (tk) subFail++;
               } catch { subFail++; }
             }));
           }
@@ -293,7 +402,7 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
    *  mode "fields": the backup's top-level fields are written onto the document; fields the backup does not mention stay as they are. Server times (createTime/updateTime) cannot be restored.
    *  Refused: the membership collection (owned by the membership saga), private chat paths, chat documents that are not clearly non-1:1, malformed paths or values. Content is never echoed back. */
   const VALUE_KEY = /^(string|integer|double|boolean|null|timestamp|reference|bytes|geoPoint|array|map)Value$/;
-  const BLOCKED_TOP = new Set(["members", "_capability_probe"]);
+  const BLOCKED_TOP = new Set(["_capability_probe"]); // "members" is restored create-only ("missing" mode), like every other collection; the membership tables come back with the SQL script
   const validFields = (f: any): boolean => !!f && typeof f === "object" && !Array.isArray(f) && Object.values(f).every((v: any) => v && typeof v === "object" && Object.keys(v).length === 1 && VALUE_KEY.test(Object.keys(v)[0]));
   const FIELDS_BLOCKED = new Set(["userAccounts", "adminSettings", "coupleTenants", "musicGrants"]); // credentials and ownership: "fields" mode never overwrites these
   async function restoreFs(req: any, res: any) {
@@ -315,13 +424,11 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
       const path = String(d?._path || "");
       const segs = path.split("/");
       if (!/^[A-Za-z0-9_.-]{1,100}(\/[A-Za-z0-9_.-]{1,100})+$/.test(path) || segs.length % 2 !== 0) return res.status(400).json({ success: false, error: "A document path is malformed. Nothing was written." });
-      if (segs.length !== 2 || !isExportablePath(segs[0])) return res.status(400).json({ success: false, error: "A document is not in a known top-level app collection. Nothing was written." });
-      if (d?._missing) continue; // parent-only placeholders carry no data and are never created
+            if (d?._missing) continue; // parent-only placeholders carry no data and are never created
       if (BLOCKED_TOP.has(segs[0])) return res.status(400).json({ success: false, error: `Documents of "${segs[0]}" are never restored by the panel. Nothing was written.` });
       if (!validFields(d?.fields)) return res.status(400).json({ success: false, error: "A document has malformed fields. Nothing was written." });
       if (mode === "fields" && FIELDS_BLOCKED.has(segs[0])) return res.status(400).json({ success: false, error: `"fields" mode does not overwrite ${segs[0]}; use "missing". Nothing was written.` });
-      if (segs[0] === "chatMessages") { const cr = snakeKeys(decodeDoc({ name: path, fields: d.fields })); if (!cid || isDirectChatRow(cr) || !visibleChatRow(cr, "", true) || String(cr.couple_id ?? "") !== cid) return res.status(400).json({ success: false, error: "A chat document is not a group message of your own couple. Nothing was written." }); }
-      checked.push({ path, fields: d.fields });
+            checked.push({ path, fields: d.fields });
     }
     let created = 0, existing = 0, failed = 0; const failedPaths: string[] = [];
     for (const d of checked) {
@@ -338,5 +445,40 @@ export function makeBackupHandlers(getDb: () => any, env: Record<string, string 
     }
     return res.json({ success: true, mode, project: c.project, written: created, alreadyExisted: existing, failed, failedPaths: failedPaths.slice(0, 20) });
   }
-  return { plan, page, restoreFs };
+  async function restoreStorage(req: any, res: any) {
+    const session = requireRole(req, res, ["admin"]); if (!session) return; noStore(res);
+    if (req.body?.target === "separate") return res.status(403).json({ success: false, error: "A separately configured backup source is read-only. Nothing was written." });
+    const c = ctxFor("app"); if (!c) return res.status(400).json({ success: false, error: "No source" });
+    if (identityMismatch(c, req.body)) return res.status(409).json({ success: false, error: "The connected source does not match the one shown in the plan. Nothing was written." });
+    if (String(req.body?.confirmProject || "") !== refOf(c.sbUrl).ref) return res.status(409).json({ success: false, error: "The typed project id does not match the connected Supabase project. Nothing was written." });
+    const a = getRestAccess("app"); if (!a || !a.url || !a.key) return res.status(503).json({ success: false, error: "Storage access is not configured" });
+    const bucket = String(req.body?.bucket || ""); const path = String(req.body?.path || "");
+    if (!STORAGE_ID.test(bucket) || !storagePathOk(path)) return res.status(400).json({ success: false, error: "Invalid bucket or path. Nothing was written." });
+    const b64 = String(req.body?.b64 || ""); if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64) || b64.length > 3_000_000) return res.status(400).json({ success: false, error: "Invalid file data. Nothing was written." });
+    const mime = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(String(req.body?.mime || "")) ? String(req.body.mime) : "application/octet-stream";
+    const base = `${a.url.replace(/\/+$/, "")}/storage/v1`;
+    // The file arrives whole (the client sends one call per file up to 3MB; larger files are refused by the client with an explicit report). Existing objects are never overwritten.
+    const r = await fetchImpl(`${base}/object/${encodeURIComponent(bucket)}/${path.split("/").map(encodeURIComponent).join("/")}`, { method: "POST", headers: { apikey: a.key, Authorization: `Bearer ${a.key}`, "Content-Type": mime, "x-upsert": "false" }, body: Buffer.from(b64, "base64") });
+    if (r.ok) return res.json({ success: true, written: true });
+    const j: any = await r.json().catch(() => ({})); const dup = r.status === 409 || /already exists|Duplicate/i.test(String(j?.message || j?.error || ""));
+    return res.json({ success: true, written: false, alreadyExisted: dup, failed: !dup });
+  }
+  /** Large files: the browser uploads straight to Storage with a one-object signed upload URL, so the file never passes through the function body limit. Same guards as restoreStorage; existing objects are never replaced. */
+  async function signStorage(req: any, res: any) {
+    const session = requireRole(req, res, ["admin"]); if (!session) return; noStore(res);
+    if (req.body?.target === "separate") return res.status(403).json({ success: false, error: "A separately configured backup source is read-only. Nothing was written." });
+    const c = ctxFor("app"); if (!c) return res.status(400).json({ success: false, error: "No source" });
+    if (identityMismatch(c, req.body)) return res.status(409).json({ success: false, error: "The connected source does not match the one shown in the plan. Nothing was written." });
+    if (String(req.body?.confirmProject || "") !== refOf(c.sbUrl).ref) return res.status(409).json({ success: false, error: "The typed project id does not match the connected Supabase project. Nothing was written." });
+    const a = getRestAccess("app"); if (!a || !a.url || !a.key) return res.status(503).json({ success: false, error: "Storage access is not configured" });
+    const bucket = String(req.body?.bucket || ""); const path = String(req.body?.path || "");
+    if (!STORAGE_ID.test(bucket) || !storagePathOk(path)) return res.status(400).json({ success: false, error: "Invalid bucket or path. Nothing was written." });
+    const base = `${a.url.replace(/\/+$/, "")}/storage/v1`;
+    const r = await fetchImpl(`${base}/object/upload/sign/${encodeURIComponent(bucket)}/${path.split("/").map(encodeURIComponent).join("/")}`, { method: "POST", headers: { apikey: a.key, Authorization: `Bearer ${a.key}`, "Content-Type": "application/json", "x-upsert": "false" }, body: "{}" });
+    const j: any = await r.json().catch(() => ({}));
+    if (r.ok && typeof j?.url === "string" && j.url.startsWith("/object/upload/sign/")) return res.json({ success: true, uploadUrl: `${base}${j.url}` });
+    const dup = r.status === 409 || /already exists|Duplicate/i.test(String(j?.message || j?.error || ""));
+    return res.json({ success: true, alreadyExisted: dup, failed: !dup });
+  }
+  return { plan, page, restoreFs, restoreStorage, signStorage };
 }

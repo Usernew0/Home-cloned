@@ -1,9 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
+import { buildStorageOwnerSql } from "../lib/backupSchemaSql";
 import { Database, Download, Loader2, ShieldAlert, CheckCircle2, AlertTriangle, KeyRound, FileCheck2 } from "lucide-react";
-import { planExpect, buildManifest, checkIdentity, fetchPlan, restoreFirestoreDocs, runExport, verifyBackup, type TableReport } from "../lib/backupClient";
+import { planExpect, buildManifest, checkIdentity, fetchPlan, restoreFirestoreDocs, restoreStorageFiles, runExport, verifyBackup, type TableReport } from "../lib/backupClient";
 import { toCsvZip, toJson, toNdjson } from "../lib/backupFormats";
 import { decryptText, encryptText } from "../lib/backupCrypto";
 import { buildRestoreSql } from "../lib/backupRestoreSql";
+import { buildFullRestoreSql } from "../lib/backupSchemaSql";
 
 type Mode = "readable" | "full";
 type Format = "json" | "ndjson" | "csv";
@@ -25,6 +27,8 @@ export const BackupDataSection: React.FC = () => {
   const [confirmCred, setConfirmCred] = useState("");
   const [fsConfirm, setFsConfirm] = useState("");
   const [fsMsg, setFsMsg] = useState("");
+  const [stConfirm, setStConfirm] = useState("");
+  const [stMsg, setStMsg] = useState("");
   const fileRef = useRef<any>(null);
   const [plan, setPlan] = useState<any>(null);
   const [planError, setPlanError] = useState("");
@@ -61,10 +65,10 @@ export const BackupDataSection: React.FC = () => {
     try {
       const id = checkIdentity(plan, sources, { supabaseRef: expSb, firestoreProject: expFs });
       if (!id.ok) { setError(id.message); return; }
-      const { tables, reports: reps } = await runExport(sources, plan, undefined, setProgress, { full, target });
+      const { tables, reports: reps, coherence } = await runExport(sources, plan, undefined, setProgress, { full, target });
       setReports(reps);
       if (!tables.length) { setError("Nothing was read, so no file was made."); return; }
-      const manifest = buildManifest(sources, reps, plan, { full, identityChecked: id.checked, target });
+      const manifest = buildManifest(sources, reps, plan, { full, identityChecked: id.checked, target, coherence });
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const tag = [sources.supabase ? plan?.supabase?.ref : "", sources.firestore ? plan?.firestore?.project : ""].filter(Boolean).join("_");
       if (full) {
@@ -90,14 +94,31 @@ export const BackupDataSection: React.FC = () => {
   };
   const restoreSql = (m: "missing" | "overwrite" | "dry") => {
     if (!vResult || !fileRef.current) return;
-    const { sql, skipped } = buildRestoreSql(fileRef.current, m === "dry" ? "missing" : m, "", { dryRun: m === "dry" });
+    const f: any = fileRef.current;
+    const sqlMembers = Object.entries(f.tables || {}).filter(([n]) => /^pg_public\.(.*member.*|user_accounts|.*couple.*)$/i.test(n)).map(([n, t]: any) => `${n.replace("pg_public.", "")}: ${(t.rows || []).length}`);
+    const memberNote = sqlMembers.length ? `\n\nThis file holds membership data as it was when the backup was taken (${sqlMembers.join(", ")} rows). Restoring it can give access back to people who were unlinked or removed after the backup.` : "";
+    if (f.manifest?.catalog && !window.confirm("This script RUNS SQL definitions (functions, triggers, policies, views) stored in the file. Continue only if this file was made by you from your own project. After running it, read the Messages / Notices output of the SQL Editor." + memberNote)) return;
+    const { sql, skipped } = f.manifest?.catalog ? buildFullRestoreSql(f, m === "dry" ? "missing" : m, m === "dry") : buildRestoreSql(f, m === "dry" ? "missing" : m, "", { dryRun: m === "dry" });
     download(`restore-${m === "dry" ? "DRYRUN" : m}-${(vResult.ref || "unknown").replace(/[^A-Za-z0-9_-]/g, "_")}.sql`, sql, "text/plain");
     if (skipped.length) setVError(`Not in the script: ${skipped.join("; ")}`);
   };
-  const clearFile = () => { fileRef.current = null; setVResult(null); setVFile(null); setVPass(""); setFsMsg(""); };
+  const clearFile = () => { fileRef.current = null; setVResult(null); setVFile(null); setVPass(""); setFsMsg(""); setStMsg(""); setStConfirm(""); };
+  const ownerSql = () => {
+    if (!fileRef.current) return; const { sql, count } = buildStorageOwnerSql(fileRef.current as any);
+    download(`storage-owner-${(vResult?.ref || "unknown").replace(/[^A-Za-z0-9_-]/g, "_")}.sql`, sql, "text/plain"); setStMsg(`Owner script for ${count} object(s) downloaded. Run it in the SQL Editor after the upload.`);
+  };
+  const restoreSt = async () => {
+    if (!fileRef.current || !plan) return;
+    if (!window.confirm(`Upload the Storage files from this file into Supabase project ${stConfirm}? Files that already exist are not changed. Afterwards run the owner script in the SQL Editor so uploaders can delete their own media.`)) return;
+    setBusy(true); setStMsg("Working");
+    try { const t = await restoreStorageFiles(fileRef.current, { confirmProject: stConfirm, expect: planExpect(plan) }, undefined, setStMsg); setStMsg(`Storage: ${t.written} uploaded, ${t.alreadyExisted} already there with identical bytes, ${t.conflicting} already there with DIFFERENT bytes (not changed), ${t.failed} failed, ${t.tooLarge} unreadable in the file, of ${t.files}.${t.failed ? " Failed: " + t.failedPaths.join(", ") : ""}`); }
+    catch (e: any) { setStMsg(String(e?.message || "Storage restore failed")); } finally { setBusy(false); }
+  };
   const restoreFs = async () => {
     if (!fileRef.current || !plan) return;
-    if (!window.confirm(`Write the Firestore documents from this file into project ${fsConfirm}? Existing documents are not changed.`)) return;
+    const memberDocs = Object.entries((fileRef.current as any)?.tables || {}).filter(([n]) => n.startsWith("firestore_")).reduce((n, [, t]: any) => n + (t.rows || []).filter((r: any) => typeof r?._path === "string" && r._path.startsWith("members/") && !r._missing).length, 0);
+    const memberNote = memberDocs ? `\n\nThis includes ${memberDocs} membership document(s) as they were at backup time. Restoring them can give access back to people who were unlinked or removed after the backup.` : "";
+    if (!window.confirm(`Write the Firestore documents from this file into project ${fsConfirm}? Existing documents are not changed.${memberNote}`)) return;
     setBusy(true); setFsMsg("Working");
     try { const t = await restoreFirestoreDocs(fileRef.current, { target, confirmProject: fsConfirm, mode: "missing", expect: planExpect(plan) }, undefined, setFsMsg); setFsMsg(`Firestore: ${t.written} created, ${t.alreadyExisted} already existed, ${t.failed} failed of ${t.documents}.${t.failed ? " Failed: " + t.failedPaths.join(", ") : ""}`); }
     catch (e: any) { setFsMsg(String(e?.message || "Firestore restore failed")); } finally { setBusy(false); }
@@ -123,7 +144,7 @@ export const BackupDataSection: React.FC = () => {
               {plan.targets.map((t: any) => <option key={t.id} value={t.id}>{t.label}</option>)}
             </select>
           )}
-          {target === "separate" && <div className="mb-2 text-amber-200">Separate source: read-only. Chat is not backed up from it (all chat rows are left out), and nothing can be written back to it from this panel. Not a snapshot.</div>}
+          {target === "separate" && <div className="mb-2 text-amber-200">Separate source: read-only. Nothing can be written back to it from this panel. Not a snapshot. An encrypted data copy includes all chat and credentials from it.</div>}
           <div className="font-mono break-all">Supabase project: <b>{plan.supabase?.ref || "unknown"}</b></div>
           <div className="font-mono break-all">Firestore project: <b>{plan.firestore?.project || "not set"}</b></div>
           <div className="mt-1 text-sky-200/80">Check these against the project you mean to copy. Optionally type what you expect below: a mismatch stops the export.</div>
@@ -137,7 +158,7 @@ export const BackupDataSection: React.FC = () => {
       <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200 leading-relaxed flex gap-3">
         <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
         <div>
-          Chat is NOT backed up here: private 1:1 messages and other couples' chat are never copied. Only a fixed list of 17 public Supabase tables and the known top-level Firestore collections are read. Not included: schema, policies, auth users, Storage files, Firestore rules. Tables are read one after another, not in one snapshot. Keep every file private.
+          {full ? "Encrypted data copy (owner backup): includes ALL accounts, all couples' chat including private 1:1 messages, and password hashes, 2FA secrets and tokens, exactly as stored. Locked with your passphrase. Passwords are copied as hashes, not as original text. " : "Readable export: private 1:1 chat, other couples' chat and secrets are left out. This is for reading, not a backup. "}Only the fixed list of 17 public Supabase tables and Firestore (all collections and nested ones in the encrypted copy) are read. Not included: schema, policies, auth users, Storage files, Firestore rules, project settings. Tables are read one after another, not in one snapshot. Keep every file private.
         </div>
       </div>
 
@@ -148,11 +169,11 @@ export const BackupDataSection: React.FC = () => {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <label className="rounded-2xl border border-white/10 bg-neutral-950/60 p-4 flex gap-3 cursor-pointer">
             <input type="checkbox" checked={supabase} onChange={(e) => setSupabase(e.target.checked)} disabled={busy || !plan.supabase?.available} />
-            <span className="text-sm text-white">Supabase<span className="block text-[11px] text-neutral-400">{plan.supabase?.available ? `${plan.supabase.tables.length} tables checked, missing ones are skipped` : "Not available on the server"}</span></span>
+            <span className="text-sm text-white">Supabase<span className="block text-[11px] text-neutral-400">{plan.supabase?.available ? (plan.catalog?.ok ? `Database connected: ${plan.catalog.data.tables.length} tables (public, auth, storage), schema, policies and functions are read` : `${plan.supabase.tables.length} tables checked, missing ones are skipped. Database-level copy is off: ${plan.catalog?.reason || "no connection"}`) : "Not available on the server"}</span></span>
           </label>
           <label className={`rounded-2xl border border-white/10 bg-neutral-950/60 p-4 flex gap-3 ${plan.firestore?.available ? "cursor-pointer" : "opacity-70"}`}>
             <input type="checkbox" checked={sources.firestore} onChange={(e) => setFirestore(e.target.checked)} disabled={busy || !plan.firestore?.available} />
-            <span className="text-sm text-white">Firestore<span className="block text-[11px] text-neutral-400">{plan.firestore?.available ? `${plan.firestore.collections.length} known top-level collections (nested collections are reported, not exported)${plan.firestore.notExported?.length ? `. NOT exported, needs a decision: ${plan.firestore.notExported.join(", ")}` : ""}` : plan.firestore?.note || "Not available"}</span></span>
+            <span className="text-sm text-white">Firestore<span className="block text-[11px] text-neutral-400">{plan.firestore?.available ? `${plan.firestore.collections.length} known top-level collections ${full ? "(the encrypted copy reads every collection found, nested ones included)" : "(readable export: nested collections are reported, not exported)"}${plan.firestore.notExported?.length ? `. NOT exported, needs a decision: ${plan.firestore.notExported.join(", ")}` : ""}` : plan.firestore?.note || "Not available"}</span></span>
           </label>
         </div>
       )}
@@ -202,7 +223,7 @@ export const BackupDataSection: React.FC = () => {
             {problems.length ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
             {problems.length ? `${problems.length} item(s) need attention, the file only holds what was read` : "Every listed table was read without a reported problem"}
           </div>
-          {excludedTotal > 0 && <div className="text-[11px] text-neutral-400 mb-1">{excludedTotal} private chat rows were left out on purpose.</div>}
+          {excludedTotal > 0 && <div className="text-[11px] text-neutral-400 mb-1">{excludedTotal} private chat rows were left out of this readable export on purpose.</div>}
           <div className="max-h-56 overflow-auto text-[11px] font-mono text-neutral-300 space-y-0.5">
             {reports.map((r) => (
               <div key={r.name} className={r.status === "ok" ? "" : r.status === "skipped" ? "text-neutral-500" : "text-amber-300"}>
@@ -234,10 +255,22 @@ export const BackupDataSection: React.FC = () => {
                 <button type="button" onClick={() => restoreSql("overwrite")} className="px-3 py-1.5 rounded-lg bg-red-800 text-white">Restore script: overwrite same-id rows</button>
               </div>
             )}
+            {vResult.ok && target === "app" && (fileRef.current?.tables?.storage_files?.rows?.length || 0) > 0 && (
+              <div className="pt-2 space-y-1 border-t border-white/10 mt-2">
+                <div className="text-amber-300">Restore order: 1) the SQL restore script, 2) upload the Storage files here, 3) the storage owner script in the SQL Editor (it puts back owner and owner_id only; other object metadata is not preserved), 4) Firestore documents.</div>
+                <div className="text-neutral-400">Storage files in this file can be uploaded back (new files only, nothing existing is changed). Large files go straight to Storage. A file that already exists is only counted as present when its bytes match.</div>
+                <div className="text-neutral-300">Type the Supabase project ref to upload into:</div>
+                <input className={inputCls} placeholder="Supabase project ref" value={stConfirm} onChange={(e) => setStConfirm(e.target.value)} disabled={busy} />
+                <button type="button" onClick={restoreSt} disabled={busy || !stConfirm} className="px-3 py-1.5 rounded-lg bg-red-800 text-white disabled:opacity-50">Upload missing Storage files</button>
+                <button type="button" onClick={ownerSql} disabled={busy} className="px-3 py-1.5 rounded-lg bg-neutral-700 text-white disabled:opacity-50 ml-2">Download storage owner script (run after the upload)</button>
+                {stMsg && <div>{stMsg}</div>}
+              </div>
+            )}
             {vResult.ok && vResult.fs && target === "app" && (
               <div className="pt-2 space-y-1 border-t border-white/10 mt-2">
-                <div className="text-neutral-400">Firestore documents in this file can be written back (new documents only, nothing existing is changed; membership, chat and unknown collections are refused). Never run against a real project during this build's tests.</div>
-                <input className={inputCls} placeholder="Type the Firestore project id to write into" value={fsConfirm} onChange={(e) => setFsConfirm(e.target.value)} disabled={busy} />
+                <div className="text-neutral-400">Firestore: documents that already exist are never changed; only new documents are written, and only into the project whose ID you type below. There is no Firestore dry run, so check the source project and the intended target first.</div>
+                <div className="text-neutral-300">Type the Firestore project ID to write into:</div>
+                <input className={inputCls} placeholder="Firestore project ID" value={fsConfirm} onChange={(e) => setFsConfirm(e.target.value)} disabled={busy} />
                 <button type="button" onClick={restoreFs} disabled={busy || !fsConfirm} className="px-3 py-1.5 rounded-lg bg-red-800 text-white disabled:opacity-50">Write missing Firestore documents</button>
                 {fsMsg && <div>{fsMsg}</div>}
               </div>

@@ -210,7 +210,21 @@ function getSeparateDb() {
 let appBackupDbCache: any = null;
 /** The app target reads with its own client over the same project and key, so number handling for backups never touches the app's normal client. */
 function getAppBackupDb() { if (appBackupDbCache) return appBackupDbCache; if (!supabaseUrl || !supabaseKey) return null; appBackupDbCache = createClient(supabaseUrl, supabaseKey, { ...NO_SESSION, global: { fetch: exactNumbersFetch((globalThis as any).fetch) } }); return appBackupDbCache; }
-const backupHandlers = makeBackupHandlers(() => getAppBackupDb(), process.env, (globalThis as any).fetch, redactAdminRow, getSeparateDb);
+import { buildPgConfig, dbProjectRef } from "./pgConfig.js";
+const pgOpener = (url: string | undefined, expectedRef: string) => (): any => {
+  const raw = String(url || "").trim(); if (!raw) return null;
+  let ref: string | null = null; try { ref = dbProjectRef(new URL(raw)); } catch { /* reported when opened */ }
+  const open: any = async () => {
+    const { default: pg } = await import("pg");
+    const { SUPABASE_ROOT_CA } = await import("./supabaseCa.js");
+    const client = new (pg as any).Client(buildPgConfig(raw, expectedRef, SUPABASE_ROOT_CA));
+    client.on("error", () => {}); // a dropped connection must never crash the function
+    try { await client.connect(); } catch (e) { await client.end().catch(() => {}); throw e; }
+    return { query: (s: string, p?: any[]) => client.query(s, p), close: () => client.end() };
+  };
+  open.ref = ref; return open;
+};
+const backupHandlers = makeBackupHandlers(() => getAppBackupDb(), process.env, (globalThis as any).fetch, redactAdminRow, getSeparateDb, (t) => t === "separate" ? ((process.env.BACKUP_SOURCE_SUPABASE_URL && process.env.BACKUP_SOURCE_SUPABASE_SERVICE_ROLE_KEY) ? { url: process.env.BACKUP_SOURCE_SUPABASE_URL, key: String(process.env.BACKUP_SOURCE_SUPABASE_SERVICE_ROLE_KEY).trim() } : null) : ((supabaseUrl && supabaseKey) ? { url: supabaseUrl, key: supabaseKey } : null), (t) => pgOpener(t === "separate" ? process.env.BACKUP_SOURCE_SUPABASE_DB_URL : process.env.SUPABASE_DB_URL, (() => { try { return new URL(t === "separate" ? String(process.env.BACKUP_SOURCE_SUPABASE_URL || "") : String(supabaseUrl || "")).hostname.split(".")[0]; } catch { return ""; } })())());
 
 /** v2: an explicit couple_id that is not the resolved space (couple_default = unstamped) is refused, never rewritten. */
 export function hasForeignSpaceRow(rows: any[], space: string): boolean {
@@ -246,6 +260,8 @@ export async function proxyEntry(req: any, res: any) {
   if (raw === "backup-plan") return backupHandlers.plan(req, res);
   if (raw === "backup-page") return backupHandlers.page(req, res);
   if (raw === "backup-restore-fs") return backupHandlers.restoreFs(req, res);
+  if (raw === "backup-restore-storage") return backupHandlers.restoreStorage(req, res);
+  if (raw === "backup-sign-storage") return backupHandlers.signStorage(req, res);
   if (raw === "my-shares") return shareHandlers.mine(req, res);
   if (raw === "share-item") return shareHandlers.share(req, res);
   if (raw === "unshare-item") return shareHandlers.unshare(req, res);

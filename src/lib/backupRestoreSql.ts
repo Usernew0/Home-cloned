@@ -33,7 +33,7 @@ export function buildRestoreSql(backup: { manifest: any; tables: Record<string, 
   out.push(`-- ${dry ? "DRY RUN of the " : ""}RESTORE SCRIPT (${mode === "missing" ? "insert missing rows only" : "OVERWRITE rows that have the same key"})`);
   if (dry) out.push("-- DRY RUN: identical to the real script but it ends in ROLLBACK and skips the sequence update, so it changes no data. A passing run proves it applies on THIS schema (columns, generated columns, triggers off, foreign keys); it does not prove the data is right.");
   out.push(`-- From a data copy dated ${safeComment(m.createdAt)}, source Supabase project ref ${safeComment(m.identity?.supabaseRef)} (taken from the file, NOT checked by this script).`);
-  out.push(`-- Run it ONLY in the SQL Editor of that same project. Public tables only. Not restored: auth users, Storage files, Firestore, private 1:1 chat, chat of other couples.`);
+  out.push(`-- Run it ONLY in the SQL Editor of that same project. Public tables only (every table found in the file, including chat). Not restored: auth users, Storage files, Firestore, schema and policies.`);
   out.push(`-- THIS FILE CONTAINS PASSWORD HASHES AND 2FA SECRETS. Keep it private and delete it after use.`);
   out.push(`-- It is NOT an undo of the profile repair: rows created after the copy stay, and "overwrite" also undoes legitimate later edits to rows with the same key.`);
   out.push(`-- It runs as one transaction and stops with an error (nothing applied) if a column is missing or generated in the destination, or if triggers cannot be switched off.`);
@@ -42,15 +42,17 @@ export function buildRestoreSql(backup: { manifest: any; tables: Record<string, 
   out.push(`do $trg$ begin set local session_replication_role = replica; exception when others then raise exception 'Cannot switch triggers off in this session (needs elevated rights). Nothing was restored.'; end $trg$;`);
   out.push(FK_DO("before"));
   const names = Object.keys(backup?.tables || {}).filter((k) => k.startsWith("supabase_")).map((k) => k.slice(9));
-  const known = names.filter((n) => (BACKUP_TABLES as readonly string[]).includes(n));
-  for (const n of names) if (!known.includes(n)) skipped.push(`${safeComment(n)} (not a table this panel exports; ignored)`);
+  const knownList = BACKUP_TABLES as readonly string[];
+  const fileKeys: Record<string, string[]> = m?.inventory?.keys && typeof m.inventory.keys === "object" ? m.inventory.keys : {};
+  const known = names.filter((n) => IDENT.test(n)); // any table found in the file is restored through the destination table's own column types
+  for (const n of names) if (!known.includes(n)) skipped.push(`${safeComment(n)} (table name is not a plain identifier; not restored)`);
   const ordered = [...RESTORE_ORDER.filter((n) => known.includes(n)), ...known.filter((n) => !RESTORE_ORDER.includes(n))];
   for (const t of ordered) {
     const rows = backup.tables["supabase_" + t]?.rows;
     if (!Array.isArray(rows) || !rows.length) { skipped.push(`${t} (no rows)`); continue; }
     if (rows.some((r: any) => !r || typeof r !== "object" || Array.isArray(r))) { skipped.push(`${t} (malformed rows)`); continue; }
     if (rows.some((r: any) => r._omitted)) { skipped.push(`${t} (contains an oversize placeholder row; not restorable)`); continue; }
-    const keys = keysOf(t);
+    const keys = knownList.includes(t) ? keysOf(t) : (Array.isArray(fileKeys[t]) && fileKeys[t].every((k) => typeof k === "string" && IDENT.test(k)) ? fileKeys[t] : []);
     if (!rows.every((r: any) => keys.every((k) => k in r && r[k] !== null))) { skipped.push(`${t} (key column ${keys.join("+")} missing)`); continue; }
     const cols = [...new Set(rows.flatMap((r: any) => Object.keys(r)))];
     if (!cols.every((c) => IDENT.test(c))) { skipped.push(`${t} (a column name is not a plain identifier)`); continue; }
@@ -67,12 +69,13 @@ export function buildRestoreSql(backup: { manifest: any; tables: Record<string, 
 end $chk$;`);
     const src = `select ${colList} from jsonb_populate_recordset(null::public.${q(t)}, $${tg}$${json}$${tg}$::jsonb) as p`;
     const overwriteOk = mode === "overwrite" && keys.length === 1;
-    if (mode === "overwrite" && !overwriteOk) skipped.push(`${t} (no single unique key: only missing rows were added, nothing overwritten)`);
+    if (mode === "overwrite" && !overwriteOk) skipped.push(`${t} (${keys.length ? "no single unique key" : "no primary key"}: only rows not already present were added, nothing overwritten)`);
     if (overwriteOk) {
       const sets = cols.filter((c) => c !== keys[0]).map((c) => `${q(c)} = excluded.${q(c)}`);
       out.push(`insert into public.${q(t)} (${colList}) ${src} on conflict (${q(keys[0])}) ${sets.length ? `do update set ${sets.join(", ")}` : "do nothing"};`);
     } else {
-      out.push(`insert into public.${q(t)} (${colList}) select ${colList} from (${src}) as p where not exists (select 1 from public.${q(t)} x where ${keys.map((k) => `x.${q(k)} = p.${q(k)}`).join(" and ")});`);
+      const same = keys.length ? keys.map((k) => `x.${q(k)} = p.${q(k)}`).join(" and ") : `to_jsonb(x) = to_jsonb(p)`; // no key: a row is "already there" only if it is identical
+      out.push(`insert into public.${q(t)} (${colList}) select ${colList} from (${src}) as p where not exists (select 1 from public.${q(t)} x where ${same});`);
     }
     if (SERIAL_TABLES[t] && !dry) out.push(`select setval(pg_get_serial_sequence('public.${t}', '${SERIAL_TABLES[t]}'), (select max(${q(SERIAL_TABLES[t])}) from public.${q(t)}));`);
     covered.push(t);
