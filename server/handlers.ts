@@ -13,9 +13,10 @@ import { makeAdminAccountHandlers } from "./adminAccounts.js";
 import { membershipEnabled } from "./membership.js";
 import { makeFsPreflightHandler } from "./fsPreflight.js";
 import { makeShareHandlers, readSharedItems } from "./shares.js";
-import { resolveServerSupabaseKey } from "./serverKey.js";
+import { resolveServerSupabaseKey, isBrowserGradeKey } from "./serverKey.js";
 import { makeCoupleHandlers } from "./couple.js";
 import { makeMembershipHandlers } from "./membershipOps.js";
+import { makeBackupHandlers, exactNumbersFetch } from "./backupExport.js";
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "";
 const supabaseKey = resolveServerSupabaseKey();
@@ -197,6 +198,19 @@ const shareHandlers = makeShareHandlers(() => supabaseAdmin);
 const fsPreflightHandler = makeFsPreflightHandler(() => supabaseAdmin);
 const fsPreflightRecordHandler = makeFsPreflightHandler(() => supabaseAdmin, process.env, (globalThis as any).fetch, true);
 const adminAccountHandlers = makeAdminAccountHandlers(() => supabaseAdmin);
+let separateDbCache: any = null;
+/** Separate backup source: its own client, never the app's. A browser-grade key is refused, like the primary key. */
+function getSeparateDb() {
+  if (separateDbCache) return separateDbCache;
+  const url = process.env.BACKUP_SOURCE_SUPABASE_URL || ""; const key = (process.env.BACKUP_SOURCE_SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  if (!url || !key || isBrowserGradeKey(key)) return null;
+  separateDbCache = createClient(url, key, { ...NO_SESSION, global: { fetch: exactNumbersFetch((globalThis as any).fetch) } });
+  return separateDbCache;
+}
+let appBackupDbCache: any = null;
+/** The app target reads with its own client over the same project and key, so number handling for backups never touches the app's normal client. */
+function getAppBackupDb() { if (appBackupDbCache) return appBackupDbCache; if (!supabaseUrl || !supabaseKey) return null; appBackupDbCache = createClient(supabaseUrl, supabaseKey, { ...NO_SESSION, global: { fetch: exactNumbersFetch((globalThis as any).fetch) } }); return appBackupDbCache; }
+const backupHandlers = makeBackupHandlers(() => getAppBackupDb(), process.env, (globalThis as any).fetch, redactAdminRow, getSeparateDb);
 
 /** v2: an explicit couple_id that is not the resolved space (couple_default = unstamped) is refused, never rewritten. */
 export function hasForeignSpaceRow(rows: any[], space: string): boolean {
@@ -229,6 +243,9 @@ export async function proxyEntry(req: any, res: any) {
   if (raw === "fs-preflight") return fsPreflightHandler(req, res);
   if (raw === "fs-preflight-record") return fsPreflightRecordHandler(req, res);
   if (raw === "admin-create-account") return adminAccountHandlers.create(req, res);
+  if (raw === "backup-plan") return backupHandlers.plan(req, res);
+  if (raw === "backup-page") return backupHandlers.page(req, res);
+  if (raw === "backup-restore-fs") return backupHandlers.restoreFs(req, res);
   if (raw === "my-shares") return shareHandlers.mine(req, res);
   if (raw === "share-item") return shareHandlers.share(req, res);
   if (raw === "unshare-item") return shareHandlers.unshare(req, res);

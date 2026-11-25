@@ -111,6 +111,7 @@ import { bulkCopyAllowed } from "../lib/firebaseScope";
 import { HorizontalScrollWrapper } from "./HorizontalScrollWrapper";
 import { MilestonesCountdownManager } from "./MilestonesCountdownManager";
 import { SecurityLogsDashboard } from "./SecurityLogsDashboard";
+import { BackupDataSection } from "./BackupDataSection";
 import { TwoFactorSetupModal } from "./TwoFactorSetupModal";
 import { changeTwoFactor } from "../lib/twoFactorApi";
 import {
@@ -1225,7 +1226,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
 
   // Active section tracking via IntersectionObserver
   useEffect(() => {
-    const sectionIds = ["overview_section", "countdown_milestones_section", "users_section", "tenants_section", "activity_logs_section", "security_threats_section", "security_favicon_section", "telegram_alerts_section", "global_music_section", "credentials_section", "visibility_overrides_section", "subscription_tiers_section", "promo_coupons_section", "db_diagnostics_section", "test_report_section"];
+    const sectionIds = ["overview_section", "countdown_milestones_section", "users_section", "tenants_section", "activity_logs_section", "security_threats_section", "security_favicon_section", "backup_data_section", "telegram_alerts_section", "global_music_section", "credentials_section", "visibility_overrides_section", "subscription_tiers_section", "promo_coupons_section", "db_diagnostics_section", "test_report_section"];
 
     const observerOptions: IntersectionObserverInit = {
       root: null,
@@ -1310,6 +1311,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
       { id: "activity_logs_section", label: "Activity Logs", icon: Activity, badge: "Logs" },
       { id: "security_threats_section", label: "Security Logs", icon: ShieldAlert, badge: "Threats" },
       { id: "security_favicon_section", label: "Security & Favicon", icon: ShieldCheck, badge: "Settings" },
+      { id: "backup_data_section", label: "Backup Data", icon: Database, badge: "Export" },
       { id: "telegram_alerts_section", label: "Telegram & Security Hub", icon: Send, badge: "Hub" },
       { id: "global_music_section", label: "Global Music Vault", icon: Music, count: globalMusicTracks.length },
       { id: "credentials_section", label: "Admin Credentials", icon: KeyRound, badge: "Auth" },
@@ -2960,7 +2962,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-2.5 min-w-0">
             {/* INTEGRATED SECTION INDEX DROPDOWN */}
             <div className="relative">
               <button type="button" onClick={() => setIsSectionMenuOpen(!isSectionMenuOpen)} className="px-3 sm:px-3.5 py-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-white transition-all duration-200 text-xs font-semibold inline-flex items-center gap-2 cursor-pointer shadow-sm">
@@ -3026,13 +3028,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
               <span className="hidden sm:inline">{isSyncingAllData ? "Syncing All..." : "Sync All Data"}</span>
             </button>
 
-            <button onClick={() => setShowSqlSetupModal(true)} className="px-3 py-2 rounded-xl border border-indigo-500/40 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 hover:text-white transition-all duration-200 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer shadow-sm" title="View full Supabase SQL Schema Setup Script">
+            <button aria-label="Fix DB / SQL Script" onClick={() => setShowSqlSetupModal(true)} className="px-3 py-2 rounded-xl border border-indigo-500/40 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 hover:text-white transition-all duration-200 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer shadow-sm" title="View full Supabase SQL Schema Setup Script">
               <Code className="w-3.5 h-3.5 text-indigo-300" />
-              <span>Fix DB / SQL Script</span>
+              <span className="hidden sm:inline">Fix DB / SQL Script</span>
             </button>
-            <button onClick={onLogout} className="px-3.5 py-2 rounded-xl text-xs font-semibold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer text-rose-400 hover:text-rose-300 hover:bg-rose-950/20 border border-rose-900/10 shadow-sm">
+            <button title="Lock Panel" aria-label="Lock Panel" onClick={onLogout} className="px-3.5 py-2 rounded-xl text-xs font-semibold uppercase tracking-wider inline-flex items-center gap-1.5 transition-all cursor-pointer text-rose-400 hover:text-rose-300 hover:bg-rose-950/20 border border-rose-900/10 shadow-sm">
               <LogOut className="w-3.5 h-3.5" />
-              <span>Lock Panel</span>
+              <span className="hidden min-[420px]:inline">Lock Panel</span>
             </button>
           </div>
         </div>
@@ -3755,6 +3757,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ userAccounts, accountsLo
             }}
             onSimulateTestAlert={handleSimulateTestAlert}
           />
+        </div>
+
+        {/* BACKUP DATA (read-only export of Supabase and Firestore) */}
+        <div id="backup_data_section" className="bg-neutral-900/60 border border-white/10 rounded-3xl p-5 sm:p-7 relative shadow-xl backdrop-blur-xl scroll-mt-44 sm:scroll-mt-24">
+          <BackupDataSection />
         </div>
 
         {/* SECURITY SETTINGS & WEBSITE FAVICON (SIDE-BY-SIDE GRID) */}
